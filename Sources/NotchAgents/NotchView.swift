@@ -93,6 +93,7 @@ final class IslandModel: ObservableObject {
     /// Largest size the island can reach; the panel is sized from this.
     static let maxSize = CGSize(width: 620, height: 340)
     static let wing: CGFloat = 54
+    static let idleWing: CGFloat = 22
     /// Compact wing width: grows so every live agent's orb fits beside the hardware notch.
     static func wing(_ live: Int) -> CGFloat { max(wing, 40 + 17 * CGFloat(max(0, live - 1))) }
     static let openSpring = Animation.spring(response: 0.52, dampingFraction: 0.8)
@@ -107,7 +108,8 @@ final class IslandModel: ObservableObject {
 
     func size(_ store: AgentStore) -> CGSize {
         switch mode(store) {
-        case .idle: return notch
+        // A slim wing past the hardware notch so the island stays findable with nothing running.
+        case .idle: return CGSize(width: notch.width + Self.idleWing * 2, height: notch.height)
         case .compact: return CGSize(width: notch.width + Self.wing(store.liveAgents.count) * 2, height: notch.height)
         case .alert: return CGSize(width: max(460, notch.width + Self.wing * 2 + 150), height: notch.height + 58)
         case .question:
@@ -235,7 +237,13 @@ struct IslandView: View {
                             insertion: .blurFade(6).animation(.easeOut(duration: 0.3).delay(0.22)),
                             removal: .blurFade(4).animation(.easeIn(duration: 0.1))))
                 case .idle:
-                    EmptyView()
+                    HStack {
+                        Circle().fill(Ink.tertiary).frame(width: 5, height: 5)
+                        Spacer(minLength: model.notch.width)
+                    }
+                    .padding(.horizontal, (IslandModel.idleWing - 5) / 2)
+                    .frame(height: model.notch.height)
+                    .transition(.opacity.animation(.easeOut(duration: 0.2)))
                 }
             }
             .frame(width: size.width, height: size.height, alignment: .top)
