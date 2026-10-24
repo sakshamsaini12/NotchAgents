@@ -1,0 +1,19 @@
+# Build output
+.build/
+build/
+*.xcodeproj/xcuserdata/
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# Personal Terminal theme, not part of NotchAgents
+themes/
+
+# Python
+__pycache__/
+*.pyc
+
+# Release artifacts (attach to GitHub Releases instead)
+*.dmg
+dist/
