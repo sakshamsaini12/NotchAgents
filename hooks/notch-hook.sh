@@ -3,14 +3,24 @@
 # Never blocks Claude if the app isn't running: curl fails fast, we exit 0 silently.
 payload=$(cat)
 
-src=cli
+# Claude Code says who started it: claude-desktop (the Claude app), cli, an editor extension, or
+# sdk-* for headless runs other tools start (`claude -p`, Agent SDK apps), which aren't your sessions.
+case "${CLAUDE_CODE_ENTRYPOINT:-}" in
+  claude-desktop) src=app ;;
+  sdk-*) src=sdk ;;
+  *) src=cli ;;
+esac
+known=$src
+[ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ] || known=""
 cpid=""
 p=$PPID
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   c=$(ps -o comm= -p "$p" 2>/dev/null) || break
-  case "$c" in
-    *Claude.app*|*"Application Support/Claude"*) src=app ;;
-  esac
+  if [ -z "$known" ]; then
+    case "$c" in
+      *Claude.app*|*"Application Support/Claude"*) src=app ;;
+    esac
+  fi
   if [ -z "$cpid" ]; then
     case "$c" in
       */claude|claude|*/claude-code/*|*/.local/share/claude/versions/*) cpid=$p ;;
@@ -21,7 +31,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
         esac ;;
     esac
   fi
-  [ "$src" = app ] && [ -n "$cpid" ] && break
+  { [ -n "$known" ] || [ "$src" = app ]; } && [ -n "$cpid" ] && break
   p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
   if [ -z "$p" ] || [ "$p" -le 1 ]; then break; fi
 done

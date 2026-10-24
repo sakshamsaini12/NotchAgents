@@ -217,6 +217,11 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-icon"), i + 1 < Comman
     MainActor.assumeIsolated { AppIcon.render(to: CommandLine.arguments[i + 1]) }
     exit(0)
 }
+// `NotchAgents --render-dmg-background <dir>` draws the DMG window background (used by make_dmg.sh) and exits.
+if let i = CommandLine.arguments.firstIndex(of: "--render-dmg-background"), i + 1 < CommandLine.arguments.count {
+    MainActor.assumeIsolated { AppIcon.renderDMGBackground(to: CommandLine.arguments[i + 1]) }
+    exit(0)
+}
 let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
 app.setActivationPolicy(.accessory)

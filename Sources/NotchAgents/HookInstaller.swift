@@ -68,6 +68,23 @@ enum HookInstaller {
         return ok
     }
 
+    /// Brings already-installed hook scripts up to date with the ones in this app bundle, so an update to
+    /// the app also updates what the hooks report. Settings files are left alone; nothing is installed
+    /// where there were no scripts before.
+    static func refreshScripts() {
+        let fm = FileManager.default
+        for name in ["notch-hook", "notch-status"] {
+            let dst = dir.appendingPathComponent("\(name).sh")
+            guard fm.fileExists(atPath: dst.path), let src = Bundle.main.url(forResource: name, withExtension: "sh"),
+                  let new = try? Data(contentsOf: src), (try? Data(contentsOf: dst)) != new else { continue }
+            // Written in place of the old file in one step, so a hook running right now never sees half a script.
+            let tmp = dir.appendingPathComponent(".\(name).sh.new")
+            guard (try? new.write(to: tmp)) != nil else { continue }
+            try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: tmp.path)
+            if rename(tmp.path, dst.path) != 0 { try? fm.removeItem(at: tmp) }
+        }
+    }
+
     /// True when any Claude settings file, including a fresh ~/.claude with no projects yet, has the hook.
     static var anyInstalled: Bool {
         settingsFiles(create: false).contains { ((try? String(contentsOf: $0, encoding: .utf8)) ?? "").contains("notch-hook.sh") }

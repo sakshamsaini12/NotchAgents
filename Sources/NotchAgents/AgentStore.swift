@@ -169,6 +169,17 @@ struct Agent: Identifiable {
     var sessionStart: Date?
     var reset5h: Date?
     var resetWeek: Date?
+    /// When the shown limits were reported, so an older report (another log, a replayed tail) can't replace a newer one.
+    var limitsAt: Date?
+    /// Codex: the turn its log has open (task_started's turn_id), so only that turn's completion counts.
+    var openTurn: String?
+
+    /// Drops a usage window whose reset time has passed, as Claude Code itself does: the number shown
+    /// would be the previous window's.
+    mutating func expireLimits(now: Date = Date()) {
+        if let r = reset5h, r <= now { limit5h = nil; reset5h = nil }
+        if let r = resetWeek, r <= now { limitWeek = nil; resetWeek = nil }
+    }
 
     mutating func addLog(_ tool: String, _ detail: String?, at date: Date = Date()) {
         if let i = log.indices.first, !log[i].done { log[i].done = true }
@@ -225,6 +236,8 @@ final class AgentStore: ObservableObject {
     /// Claude processes reported by the hook script, and when each kind last sent an event. Keeps an
     /// agent live when the process scan misses it, so one missed scan can't wipe its state.
     private var hookPIDs: [AgentKind: Set<Int32>] = [:]
+    /// The transcript each Claude process last reported through its hooks: its own, for certain.
+    private var hookTranscripts: [Int32: String] = [:]
     private var lastHook: [AgentKind: Date] = [:]
     private let ledger = UsageLedger()
     /// Latest status-line payload per transcript: Claude Code's own cost and context numbers.
@@ -232,7 +245,7 @@ final class AgentStore: ObservableObject {
     private var statusByTranscript: [String: SessionStatus] = [:]
     /// Open turns per Claude session (several CLI sessions can run at once). An agent is working
     /// only while one of its sessions has an open turn.
-    private struct Turn { var start: Date; var last: Date; var transcript: String? }
+    private struct Turn { var start: Date; var last: Date; var transcript: String?; var pid: Int32? }
     private var turns: [AgentKind: [String: Turn]] = [:]
     private var codexFile: URL?
     private var codexOffset: UInt64 = 0
@@ -266,6 +279,7 @@ final class AgentStore: ObservableObject {
         // NOTCHAGENTS_PORT runs a second copy beside the installed one (development); hooks always use 47823.
         server.start(port: ProcessInfo.processInfo.environment["NOTCHAGENTS_PORT"].flatMap(UInt16.init) ?? 47823)
         SFX.prewarm()
+        io.async { HookInstaller.refreshScripts() }
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
@@ -278,7 +292,10 @@ final class AgentStore: ObservableObject {
         guard HookServer.isValid(req.token) else { reply(nil); return }
         ClaudeDirs.learn(dir: req.headers["x-notch-config"])
         ClaudeDirs.learn(transcript: req.body["transcript_path"] as? String)
-        if req.query["type"] == "status" { applyStatus(req.body); reply(nil); return }
+        if req.query["type"] == "status" {
+            if req.query["src"] != "sdk" { applyStatus(req.body, app: req.query["src"] == "app") }
+            reply(nil); return
+        }
         // Diagnostics (`curl -H "X-Notch-Token: …" 127.0.0.1:47823/?type=state`): what the app believes.
         if req.query["type"] == "state" {
             let list: [[String: Any]] = ordered.map { a in
@@ -290,27 +307,35 @@ final class AgentStore: ObservableObject {
             reply(try? JSONSerialization.data(withJSONObject: ["agents": list, "hooksActive": hooksActive, "alert": alert.map { "\($0.title): \($0.message)" } as Any], options: [.prettyPrinted]))
             return
         }
-        let kind: AgentKind = req.query["src"] == "app" ? .claudeApp : .claudeCLI
         let b = req.body
+        let pid = req.query["pid"].flatMap { Int32($0) }
+        // Headless runs (`claude -p`, Agent SDK apps, a claude started by another claude) aren't sessions
+        // you watch: their prompts and stops would show a CLI working, or finished, that you never ran.
+        if req.query["src"] == "sdk" || pid.map(ProcessScanner.isHeadless) == true { reply(nil); return }
+        // Older hook scripts only guess the source from parent processes; the transcript says outright.
+        let path = b["transcript_path"] as? String
+        let kind: AgentKind = req.query["src"] == "app" || path.map(Self.isDesktopTranscript) == true ? .claudeApp : .claudeCLI
         let event = b["hook_event_name"] as? String ?? ""
         hookSeen.insert(kind)
         hooksActive = true
         hooksInstalled = true
         lastHook[kind] = Date()
+        if let pid, let path { hookTranscripts[pid] = path }
         if let p = req.query["pid"], let pid = Int32(p) {
             if event == "SessionEnd" { hookPIDs[kind]?.remove(pid); lastHook[kind] = nil } else { hookPIDs[kind, default: []].insert(pid) }
         }
         var a = agents[kind]!
         let sid = b["session_id"] as? String ?? "default"
         let now = Date()
+        // Whether this session itself was mid-turn: another session of the same agent may still be working.
+        let sessionWasBusy = turns[kind]?[sid] != nil
         switch event {
         case "UserPromptSubmit":
-            turns[kind, default: [:]][sid] = Turn(start: now, last: now, transcript: b["transcript_path"] as? String)
+            turns[kind, default: [:]][sid] = Turn(start: now, last: now, transcript: path, pid: pid)
         case "PreToolUse", "PostToolUse", "PermissionRequest", "Notification":
-            if var t = turns[kind]?[sid] { t.last = now; turns[kind]![sid] = t }
+            if var t = turns[kind]?[sid] { t.last = now; t.pid = pid ?? t.pid; turns[kind]![sid] = t }
             else if event != "Notification" {
-                let path = b["transcript_path"] as? String
-                turns[kind, default: [:]][sid] = Turn(start: Self.lastPromptDate(path) ?? now, last: now, transcript: path)
+                turns[kind, default: [:]][sid] = Turn(start: Self.lastPromptDate(path) ?? now, last: now, transcript: path, pid: pid)
             }
         case "Stop", "SessionEnd": turns[kind]?[sid] = nil
         default: break
@@ -430,7 +455,7 @@ final class AgentStore: ObservableObject {
             }
             return
         case "Stop":
-            let wasBusy = a.status.isBusy
+            let wasBusy = a.status.isBusy && sessionWasBusy
             a.lastTurn = a.turnStart.map { Date().timeIntervalSince($0) }
             a.status = .idle; a.tool = nil; a.detail = nil; a.turnStart = nil; a.finishLog()
             if wasBusy {
@@ -536,8 +561,9 @@ final class AgentStore: ObservableObject {
     /// Claude Code's status-line payload: its own session cost and context-window numbers (exact,
     /// unlike anything derived from the transcript), plus plan usage, which is per account so both
     /// Claude agents share it.
-    private func applyStatus(_ b: [String: Any]) {
+    private func applyStatus(_ b: [String: Any], app: Bool) {
         if let path = b["transcript_path"] as? String {
+            if app || Self.isDesktopTranscript(path) { appSessions.insert(path) }
             let cw = b["context_window"] as? [String: Any]
             statusByTranscript[path] = SessionStatus(
                 cost: ((b["cost"] as? [String: Any])?["total_cost_usd"] as? NSNumber)?.doubleValue,
@@ -580,6 +606,7 @@ final class AgentStore: ObservableObject {
                 .values.max { $0.at < $1.at }
         }
         a.limit5h = l?.fiveHour; a.limitWeek = l?.week; a.reset5h = l?.reset5h; a.resetWeek = l?.resetWeek
+        a.expireLimits()
     }
     /// `/Users/me/.claude-work/projects/<project>/<session>.jsonl` → `/Users/me/.claude-work`.
     static func configRoot(_ transcript: String) -> String? {
@@ -628,7 +655,9 @@ final class AgentStore: ObservableObject {
                 var ended: [String] = []
                 for (sid, t) in quiet {
                     let stale = Date().timeIntervalSince(t.last) > 1800
-                    if stale || t.transcript.map(Self.turnEnded) == true { ended.append(sid) }
+                    // A session that quit, or was suspended (Ctrl-Z), isn't working whatever its transcript says.
+                    let gone = t.pid.map { !ProcessScanner.isRunning($0) } ?? false
+                    if stale || gone || t.transcript.map(Self.turnEnded) == true { ended.append(sid) }
                 }
                 guard !ended.isEmpty else { return }
                 Task { @MainActor in
@@ -674,8 +703,9 @@ final class AgentStore: ObservableObject {
     // MARK: - Polling
 
     private func tick() {
+        let known = hookTranscripts
         io.async { [weak self] in
-            let procs = ProcessScanner.scan()
+            let procs = ProcessScanner.scan(known: known)
             Task { @MainActor in self?.apply(procs) }
         }
         pollCodex()
@@ -698,16 +728,18 @@ final class AgentStore: ObservableObject {
     }
 
     private func apply(_ p: ProcessScanner.Result) {
+        hookTranscripts = hookTranscripts.filter { kill($0.key, 0) == 0 }
         for kind in [AgentKind.claudeCLI, .claudeApp] {
             var a = agents[kind]!
             let pids = kind == .claudeCLI ? p.claudeCLI : p.claudeApp
             let wasLive = a.live
             // The scan can miss a session (unusual installs, IDE hosts), so hook evidence also counts:
             // a pid the hook reported that is still running, a recent event, or an open approval/question.
-            let hooked = (hookPIDs[kind] ?? []).filter { kill($0, 0) == 0 }
+            let hooked = (hookPIDs[kind] ?? []).filter(ProcessScanner.isRunning)
             hookPIDs[kind] = hooked
             let recent = lastHook[kind].map { Date().timeIntervalSince($0) < 15 } ?? false
             a.live = !pids.isEmpty || !hooked.isEmpty || recent || a.pending != nil || question?.kind == kind
+            a.expireLimits()
             if a.live {
                 if let pid = a.pid, pids.contains(pid) || hooked.contains(pid) {} else { a.pid = pids.max() ?? hooked.max() ?? a.pid }
                 if !wasLive || a.status == .offline { a.status = .idle }
@@ -721,6 +753,7 @@ final class AgentStore: ObservableObject {
             agents[kind] = a
         }
         var c = agents[.codex]!
+        c.expireLimits()
         // A Codex hosted by another app (ChatGPT, Open Design, editors) keeps its app-server around
         // between runs, so it counts while a turn is open or for a few minutes after its log last changed.
         let since = codexWritten.map { Date().timeIntervalSince($0) } ?? .infinity
@@ -907,22 +940,42 @@ final class AgentStore: ObservableObject {
             let env = LaunchEnvironment.codexHome.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
             let home = env ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
             // Hosts like Open Design move a session's log to archived_sessions/ while it is still in use,
-            // so both folders count. Guardian/subagent logs show Codex is busy but aren't the session.
+            // so both folders count. Guardian/subagent logs show Codex is busy but aren't the session, and
+            // throwaway runs in a temp folder (hosts probing that Codex works) aren't anyone's session at all.
             let recent = (Self.recentFiles(in: home.appendingPathComponent("sessions"), ext: "jsonl", depth: 4)
                 + Self.recentFiles(in: home.appendingPathComponent("archived_sessions"), ext: "jsonl", depth: 0))
-                .sorted { Self.mtime($0) > Self.mtime($1) }
-            guard let written = recent.first.map(Self.mtime) else { return }
-            let main = recent.prefix(8).first { !Self.isCodexSubagent($0) }
+                .map { (url: $0, date: Self.mtime($0)) }.sorted { $0.date > $1.date }.prefix(12)
+            let logs = recent.map { (url: $0.url, date: $0.date, meta: Self.codexMeta($0.url)) }.filter { !$0.meta.probe }
+            // Plan usage belongs to the login, which every log under this Codex home shares, so the newest
+            // report in any of them (probes and subagents included) is the current one.
+            let limits = recent.compactMap { Self.codexLimits(in: $0.url) }.max { $0.at < $1.at }
+            guard let written = logs.first?.date else { return }
+            let main = logs.first { !$0.meta.subagent }
             Task { @MainActor in
-                self?.codexWritten = written
-                if let main { self?.readCodex(main) }
+                guard let self else { return }
+                if let l = limits, var c = self.agents[.codex], l.at > (c.limitsAt ?? .distantPast) {
+                    c.limit5h = l.fiveHour; c.limitWeek = l.week; c.reset5h = l.reset5h; c.resetWeek = l.resetWeek
+                    c.limitsAt = l.at
+                    c.expireLimits()
+                    self.agents[.codex] = c
+                }
+                self.codexWritten = written
+                guard let main else { return }
+                // Stay with the session whose turn is open until that turn ends or goes quiet, instead of
+                // hopping to whichever other log was written last (and losing the turn in the switch).
+                if let cur = self.codexFile, cur != main.url, self.codexPhase.isBusy,
+                   let curDate = logs.first(where: { $0.url == cur })?.date, Date().timeIntervalSince(curDate) < 600 {
+                    self.readCodex(cur)
+                } else {
+                    self.readCodex(main.url)
+                }
             }
         }
     }
 
     private func readCodex(_ url: URL) {
         // A different session's log: its own events decide its state, not the previous log's.
-        if url != codexFile { codexFile = url; codexOffset = 0; codexPhase = .idle }
+        if url != codexFile { codexFile = url; codexOffset = 0; codexPhase = .idle; agents[.codex]?.openTurn = nil }
         let offset = codexOffset
         io.async { [weak self] in
             guard let h = try? FileHandle(forReadingFrom: url) else { return }
@@ -976,7 +1029,8 @@ final class AgentStore: ObservableObject {
         }
     }
 
-    private static let iso: ISO8601DateFormatter = {
+    // Formatters are thread-safe; this one is also used off the main actor (limit scans on io).
+    nonisolated(unsafe) private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return f
@@ -984,7 +1038,7 @@ final class AgentStore: ObservableObject {
 
     /// Returns true when this event completed a live turn just now.
     @discardableResult
-    private static func applyCodex(_ o: [String: Any], to a: inout Agent) -> Bool {
+    private nonisolated static func applyCodex(_ o: [String: Any], to a: inout Agent) -> Bool {
         guard let p = o["payload"] as? [String: Any] else { return false }
         if o["type"] as? String == "turn_context" {
             if let m = p["model"] as? String { a.model = m }
@@ -1005,9 +1059,15 @@ final class AgentStore: ObservableObject {
         case "task_started":
             a.status = .thinking
             a.tool = nil; a.turnStart = when
+            a.openTurn = p["turn_id"] as? String
         case "task_complete", "turn_aborted":
-            // Only a turn that ran to completion is "finished"; Esc/interrupts end it quietly.
+            // Only the open turn running to completion is "finished"; Esc/interrupts end it quietly, and a
+            // completion for some other turn id (one this log never started) says nothing about this one.
+            let id = p["turn_id"] as? String
+            let ours = id == nil || a.openTurn == nil || id == a.openTurn
+            guard ours else { return false }
             let completed = t == "task_complete" && fresh && a.status.isBusy
+            a.openTurn = nil
             a.lastTurn = a.turnStart.map { when.timeIntervalSince($0) }
             a.status = .idle
             a.turnStart = nil; a.finishLog()
@@ -1029,12 +1089,20 @@ final class AgentStore: ObservableObject {
                 if let last = info["last_token_usage"] as? [String: Any] { a.contextUsed = last["input_tokens"] as? Int ?? 0 }
                 if let w = info["model_context_window"] as? Int { a.contextWindow = w }
             }
-            if let rl = p["rate_limits"] as? [String: Any] {
+            // Codex reports several limit buckets; "codex" is the plan's 5-hour/weekly usage. Others (like
+            // "premium") often come with empty windows and must not wipe it, and an older report never
+            // replaces a newer one.
+            if let rl = p["rate_limits"] as? [String: Any], (rl["limit_id"] as? String ?? "codex") == "codex",
+               when >= (a.limitsAt ?? .distantPast) {
                 let pri = rl["primary"] as? [String: Any], sec = rl["secondary"] as? [String: Any]
-                a.limit5h = pri?["used_percent"] as? Double
-                a.limitWeek = sec?["used_percent"] as? Double
-                a.reset5h = (pri?["resets_at"] as? Double).map { Date(timeIntervalSince1970: $0) }
-                a.resetWeek = (sec?["resets_at"] as? Double).map { Date(timeIntervalSince1970: $0) }
+                if pri != nil || sec != nil {
+                    func pct(_ w: [String: Any]?) -> Double? { (w?["used_percent"] as? NSNumber)?.doubleValue }
+                    func reset(_ w: [String: Any]?) -> Date? { (w?["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) } }
+                    a.limit5h = pct(pri); a.limitWeek = pct(sec)
+                    a.reset5h = reset(pri); a.resetWeek = reset(sec)
+                    a.limitsAt = when
+                    a.expireLimits()
+                }
             }
         default: break
         }
@@ -1087,6 +1155,24 @@ final class AgentStore: ObservableObject {
 
     // MARK: - File helpers
 
+    /// Who wrote a Claude transcript, from the `entrypoint` its entries carry: "claude-desktop" for the
+    /// Claude app, "cli", an editor extension, or "sdk-…". nil until the first entry is written.
+    nonisolated static func transcriptEntrypoint(_ path: String) -> String? {
+        entrypointLock.lock(); let cached = entrypointCache[path]; entrypointLock.unlock()
+        if let cached { return cached }
+        guard let h = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? h.close() }
+        let head = String(decoding: h.readData(ofLength: 256 * 1024), as: UTF8.self)
+        guard let r = head.range(of: "\"entrypoint\":\""),
+              let end = head[r.upperBound...].firstIndex(of: "\"") else { return nil }
+        let e = String(head[r.upperBound..<end])
+        entrypointLock.lock(); entrypointCache[path] = e; entrypointLock.unlock()
+        return e
+    }
+    nonisolated static func isDesktopTranscript(_ path: String) -> Bool { transcriptEntrypoint(path) == "claude-desktop" }
+    nonisolated(unsafe) private static var entrypointCache: [String: String] = [:]
+    nonisolated private static let entrypointLock = NSLock()
+
     nonisolated static func json(_ s: Substring) -> [String: Any]? {
         (try? JSONSerialization.jsonObject(with: Data(s.utf8))) as? [String: Any]
     }
@@ -1121,15 +1207,37 @@ final class AgentStore: ObservableObject {
         return out
     }
 
-    /// A Codex rollout written by a subagent (guardian reviews and the like), from its session_meta line.
-    nonisolated static func isCodexSubagent(_ url: URL) -> Bool {
-        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
+    /// From a Codex rollout's session_meta line: written by a subagent (guardian reviews and the like),
+    /// or a throwaway run in a temp folder (apps checking that Codex works). Cached per file; only
+    /// touched from the store's io queue.
+    nonisolated static func codexMeta(_ url: URL) -> (subagent: Bool, probe: Bool) {
+        if let m = codexMetaCache[url.path] { return m }
+        guard let h = try? FileHandle(forReadingFrom: url) else { return (false, false) }
         defer { try? h.close() }
-        let head = String(decoding: h.readData(ofLength: 8192), as: UTF8.self)
-        guard let r = head.range(of: "\"source\"") else { return false }
-        let after = head[r.upperBound...].prefix(40).filter { !$0.isWhitespace }
-        return after.hasPrefix(":{\"subagent\"")
+        // session_meta carries the base instructions, so it can run to tens of kilobytes.
+        let data = h.readData(ofLength: 512 * 1024)
+        guard let nl = data.firstIndex(of: 0x0A), let o = json(Substring(String(decoding: data[..<nl], as: UTF8.self))),
+              o["type"] as? String == "session_meta", let p = o["payload"] as? [String: Any] else { return (false, false) }
+        let subagent = (p["source"] as? [String: Any])?["subagent"] != nil
+        let cwd = (p["cwd"] as? String).map { ($0 as NSString).resolvingSymlinksInPath } ?? ""
+        let temps = [NSTemporaryDirectory(), "/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/"]
+            .map { ($0 as NSString).resolvingSymlinksInPath }
+        let probe = !cwd.isEmpty && temps.contains { cwd.hasPrefix($0.hasSuffix("/") ? $0 : $0 + "/") }
+        codexMetaCache[url.path] = (subagent, probe)
+        return (subagent, probe)
     }
+    /// The newest plan-usage report in a Codex log's tail.
+    nonisolated static func codexLimits(in url: URL) -> (fiveHour: Double?, week: Double?, reset5h: Date?, resetWeek: Date?, at: Date)? {
+        guard let lines = tailLines(url.path, bytes: 256 * 1024) else { return nil }
+        for line in lines.reversed() where line.contains("\"rate_limits\"") {
+            guard let o = json(line) else { continue }
+            var a = Agent(kind: .codex)
+            applyCodex(o, to: &a)
+            if let at = a.limitsAt { return (a.limit5h, a.limitWeek, a.reset5h, a.resetWeek, at) }
+        }
+        return nil
+    }
+    nonisolated(unsafe) private static var codexMetaCache: [String: (subagent: Bool, probe: Bool)] = [:]
 
     nonisolated static func newestFile(in root: URL, ext: String, depth: Int) -> URL? {
         let fm = FileManager.default
@@ -1162,19 +1270,21 @@ enum ProcessScanner {
 
     /// Every process's parent, executable path and whether it has a terminal, read from the kernel.
     /// (Spawning `ps` twice per scan cost more CPU than the rest of the app put together.)
-    static func table() -> (parent: [Int32: Int32], comm: [Int32: String], tty: [Int32: Bool]) {
+    static func table() -> (parent: [Int32: Int32], comm: [Int32: String], tty: [Int32: Bool], stopped: Set<Int32>) {
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
         var size = 0
-        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0 else { return ([:], [:], [:]) }
+        guard sysctl(&mib, 4, nil, &size, nil, 0) == 0 else { return ([:], [:], [:], []) }
         size += size / 8                                      // room for processes started in between
         var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride)
-        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return ([:], [:], [:]) }
+        guard sysctl(&mib, 4, &procs, &size, nil, 0) == 0 else { return ([:], [:], [:], []) }
         procs.removeLast(procs.count - size / MemoryLayout<kinfo_proc>.stride)
 
-        var parent: [Int32: Int32] = [:], comm: [Int32: String] = [:], tty: [Int32: Bool] = [:]
+        var parent: [Int32: Int32] = [:], comm: [Int32: String] = [:], tty: [Int32: Bool] = [:], stopped: Set<Int32> = []
         var path = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
         for p in procs {
             let pid = p.kp_proc.p_pid
+            // Suspended (Ctrl-Z) or exited-but-unreaped: present, but not running anything.
+            if p.kp_proc.p_stat == SSTOP || p.kp_proc.p_stat == SZOMB { stopped.insert(pid) }
             parent[pid] = p.kp_eproc.e_ppid
             tty[pid] = p.kp_eproc.e_tdev != -1
             if proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
@@ -1183,7 +1293,36 @@ enum ProcessScanner {
                 comm[pid] = withUnsafeBytes(of: p.kp_proc.p_comm) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
             }
         }
-        return (parent, comm, tty)
+        return (parent, comm, tty, stopped)
+    }
+
+    /// One process's kernel record, or nil once it has exited.
+    private static func info(_ pid: Int32) -> kinfo_proc? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var p = kinfo_proc(), size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &p, &size, nil, 0) == 0, size > 0, p.kp_proc.p_pid == pid else { return nil }
+        return p
+    }
+
+    /// The process exists and isn't suspended (Ctrl-Z) or a zombie.
+    static func isRunning(_ pid: Int32) -> Bool {
+        guard let p = info(pid) else { return false }
+        return p.kp_proc.p_stat != SSTOP && p.kp_proc.p_stat != SZOMB
+    }
+
+    /// A claude process that isn't an interactive session: a `-p` run, a helper mode, or one started by
+    /// another claude (subagents, tools that shell out to claude).
+    static func isHeadless(_ pid: Int32) -> Bool {
+        let a = args(of: pid) ?? ""
+        let words = a.split(separator: " ").map(String.init)
+        if words.contains("-p") || words.contains("--print") || helperFlags.contains(where: a.contains) { return true }
+        var cur = info(pid)?.kp_eproc.e_ppid ?? 1
+        var path = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        for _ in 0..<16 where cur > 1 {
+            if proc_pidpath(cur, &path, UInt32(path.count)) > 0, isClaude(comm: String(cString: path), args: args(of: cur)) { return true }
+            cur = info(cur)?.kp_eproc.e_ppid ?? 1
+        }
+        return false
     }
 
     /// A process's command line (arguments joined by spaces, like `ps -o args`), or nil if not readable.
@@ -1250,8 +1389,8 @@ enum ProcessScanner {
         return isClaude(comm: String(cString: path), args: args(of: pid))
     }
 
-    static func scan() -> Result {
-        let (parent, comm, tty) = table()
+    static func scan(known: [Int32: String] = [:]) -> Result {
+        let (parent, comm, tty, stopped) = table()
         resumed = resumed.filter { parent[$0.key] != nil }
         // Full command lines only for the processes that could be agents.
         let names = signatures.reduce(into: Set<String>()) { $0.formUnion($1.names) }
@@ -1269,7 +1408,7 @@ enum ProcessScanner {
         func hasTTY(_ pid: Int32) -> Bool { tty[pid] ?? false }
 
         var r = Result()
-        for pid in claude {
+        for pid in claude where !stopped.contains(pid) {
             let a = args[pid] ?? ""
             // Skip claude processes spawned by another claude (subagents/helpers) and helper modes.
             if let pp = parent[pid], claude.contains(pp) { continue }
@@ -1286,10 +1425,18 @@ enum ProcessScanner {
                 r.claudeCLI.append(pid)
             }
         }
+        // Each session's own transcript. The hooks' word comes first, then a --resume/--session-id flag;
+        // only then a guess from the project folder, which other sessions (the Claude app's included)
+        // write to as well, so the guess never takes a transcript another session already has.
         for pid in r.claudeCLI + r.claudeApp {
-            if let t = transcript(pid: pid, args: args[pid] ?? "") { r.transcripts[pid] = t }
+            if let t = known[pid] { r.transcripts[pid] = URL(fileURLWithPath: t) }
+            else if let t = transcript(pid: pid, args: args[pid] ?? "") { r.transcripts[pid] = t }
         }
-        for (pid, c) in comm where base(c).lowercased() == "codex" {
+        for pid in r.claudeCLI + r.claudeApp where r.transcripts[pid] == nil {
+            let taken = Set(r.transcripts.values.map(\.path))
+            if let t = guessTranscript(pid: pid, args: args[pid] ?? "", app: r.claudeApp.contains(pid), taken: taken) { r.transcripts[pid] = t }
+        }
+        for (pid, c) in comm where base(c).lowercased() == "codex" && !stopped.contains(pid) {
             if let pp = parent[pid], let pc = comm[pp], base(pc).lowercased() == "codex" { continue }
             let a = args[pid] ?? ""
             if a.contains("mcp-server") || a.contains(" mcp ") { continue }
@@ -1349,10 +1496,25 @@ enum ProcessScanner {
                 }
             }
         }
+        return nil
+    }
+
+    /// Best guess at a session's transcript when nothing names it: the newest one in its project folder
+    /// that no other session has, written by the same kind of Claude (app or CLI), and written since this
+    /// process started (an older one is a previous session's) unless it was told to continue one.
+    private static func guessTranscript(pid: Int32, args: String, app: Bool, taken: Set<String>) -> URL? {
         // Claude Code names a project folder after its path with every non-alphanumeric turned into "-".
         guard let cwd = cwd(of: pid) else { return nil }
         let name = String(cwd.map { $0.isASCII && ($0.isLetter || $0.isNumber) ? $0 : "-" })
-        return ClaudeDirs.projectRoots.compactMap { AgentStore.newestFile(in: $0.appendingPathComponent(name), ext: "jsonl", depth: 0) }
+        let words = Set(args.split(separator: " ").map(String.init))
+        let continuing = !words.isDisjoint(with: ["-c", "--continue"])
+        let since = (startTime(of: pid) ?? .distantPast).addingTimeInterval(-2)
+        return ClaudeDirs.projectRoots
+            .flatMap { AgentStore.recentFiles(in: $0.appendingPathComponent(name), ext: "jsonl", depth: 0) }
+            .filter { url in
+                !taken.contains(url.path) && (continuing || AgentStore.mtime(url) >= since)
+                    && AgentStore.transcriptEntrypoint(url.path).map { ($0 == "claude-desktop") == app } ?? true
+            }
             .max { AgentStore.mtime($0) < AgentStore.mtime($1) }
     }
 
