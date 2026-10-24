@@ -247,6 +247,9 @@ final class AgentStore: ObservableObject {
     /// later), so "finished" is only announced once Codex has stayed idle for a moment.
     private var codexDone: DispatchWorkItem?
     private var codexChainStart: Date?
+    /// Read offsets of the other Codex threads' logs (the app can run several at once). The notch
+    /// follows one; these are only watched for a turn finishing, so that one pings too.
+    private var codexSideOffsets: [URL: UInt64] = [:]
     // Each block drains its own autorelease pool; the default only drains when the thread goes idle, so
     // file reads from back-to-back blocks would pile up.
     private let io = DispatchQueue(label: "notch.io", qos: .utility, autoreleaseFrequency: .workItem)
@@ -516,13 +519,13 @@ final class AgentStore: ObservableObject {
 
     func dismissAlert() { alert = nil }
 
-    static func duration(_ t: TimeInterval?) -> String? {
+    nonisolated static func duration(_ t: TimeInterval?) -> String? {
         guard let t, t >= 86400 else { return durationUnderDay(t) }
         let s = Int(t)
         return "\(s / 86400)d \(s % 86400 / 3600)h"
     }
 
-    private static func durationUnderDay(_ t: TimeInterval?) -> String? {
+    nonisolated private static func durationUnderDay(_ t: TimeInterval?) -> String? {
         guard let t, t >= 1 else { return nil }
         let s = Int(t)
         return s >= 3600 ? "\(s / 3600)h \(s % 3600 / 60)m" : s >= 60 ? "\(s / 60)m \(s % 60)s" : "\(s)s"
@@ -1002,6 +1005,7 @@ final class AgentStore: ObservableObject {
                     self.agents[.codex] = c
                 }
                 self.codexWritten = written
+                self.watchOtherCodexThreads(logs.filter { !$0.meta.subagent && Date().timeIntervalSince($0.date) < 600 }.map(\.url))
                 guard let main else { return }
                 // Stay with the session whose turn is open until that turn ends or goes quiet, instead of
                 // hopping to whichever other log was written last (and losing the turn in the switch).
@@ -1015,9 +1019,52 @@ final class AgentStore: ObservableObject {
         }
     }
 
+    private func watchOtherCodexThreads(_ urls: [URL]) {
+        let others = urls.filter { $0 != codexFile }
+        codexSideOffsets = codexSideOffsets.filter { others.contains($0.key) }
+        let known = codexSideOffsets
+        io.async { [weak self] in
+            var offsets: [URL: UInt64] = [:]
+            var done: [(cwd: String?, took: TimeInterval?)] = []
+            for url in others {
+                guard let h = try? FileHandle(forReadingFrom: url) else { continue }
+                defer { try? h.close() }
+                let size = (try? h.seekToEnd()) ?? 0
+                // First sight: start at the end, so turns that ended before now don't ping.
+                guard let offset = known[url] else { offsets[url] = size; continue }
+                guard size > offset else { offsets[url] = offset; continue }
+                try? h.seek(toOffset: offset)
+                let data = h.readDataToEndOfFile()
+                guard let lastNL = data.lastIndex(of: 0x0A) else { offsets[url] = offset; continue }
+                offsets[url] = offset + UInt64(lastNL - data.startIndex + 1)
+                var a = Agent(kind: .codex)
+                for line in String(decoding: data[..<lastNL], as: UTF8.self).split(separator: "\n") {
+                    guard let o = Self.json(Substring(line)) else { continue }
+                    let t = (o["payload"] as? [String: Any])?["type"] as? String
+                    // Only a completion counts here; the turn's start may be in an earlier read.
+                    if t == "task_complete", !a.status.isBusy { a.status = .thinking }
+                    if Self.applyCodex(o, to: &a) { done.append((a.cwd, a.lastTurn)) }
+                }
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                for (url, o) in offsets where url != self.codexFile { self.codexSideOffsets[url] = o }
+                guard let d = done.last else { return }
+                let bits = [Self.duration(d.took).map { "Done in \($0)" } ?? "Done", d.cwd.map { ($0 as NSString).lastPathComponent }]
+                self.raise(IslandAlert(kind: .codex, style: .done, title: "Codex finished",
+                                       message: bits.compactMap { $0 }.joined(separator: "  ·  ")), for: 6)
+            }
+        }
+    }
+
     private func readCodex(_ url: URL) {
         // A different session's log: its own events decide its state, not the previous log's.
-        if url != codexFile { codexFile = url; codexOffset = 0; codexPhase = .idle; agents[.codex]?.openTurn = nil }
+        if url != codexFile {
+            // The thread being left is still watched for its turn ending, from where it was read up to.
+            if let old = codexFile, codexOffset > 0 { codexSideOffsets[old] = codexOffset }
+            codexSideOffsets[url] = nil
+            codexFile = url; codexOffset = 0; codexPhase = .idle; agents[.codex]?.openTurn = nil
+        }
         let offset = codexOffset
         io.async { [weak self] in
             guard let h = try? FileHandle(forReadingFrom: url) else { return }
@@ -1078,6 +1125,23 @@ final class AgentStore: ObservableObject {
         return f
     }()
 
+    /// Codex's built-in tools by what they do, so "sleep" reads as waiting, not as Codex asleep.
+    nonisolated static func codexToolTitle(_ name: String) -> String {
+        switch name {
+        case "sleep", "wait": "Waiting"
+        case "wait_agent": "Waiting on agent"
+        case "exec", "js": "Running code"
+        case "exec_command", "shell", "local_shell": "Bash"
+        case "spawn_agent": "Starting agent"
+        case "send_message", "followup_task": "Messaging agent"
+        case "list_agents": "Checking agents"
+        case "apply_patch": "Edit"
+        case "web_search", "web__run": "Web search"
+        case let n where n.hasPrefix("request_user_input"): "Asking you"
+        default: name
+        }
+    }
+
     /// Returns true when this event completed a live turn just now.
     @discardableResult
     private nonisolated static func applyCodex(_ o: [String: Any], to a: inout Agent) -> Bool {
@@ -1117,10 +1181,15 @@ final class AgentStore: ObservableObject {
             return completed
         case "function_call", "custom_tool_call", "local_shell_call", "web_search_call":
             if a.status != .idle { a.status = .tool }
-            a.tool = p["name"] as? String ?? t.replacingOccurrences(of: "_call", with: "")
-            if let args = p["arguments"] as? String, let j = json(Substring(args)) {
-                a.detail = summarize(j) ?? (j["cmd"] as? [String])?.joined(separator: " ")
-            } else { a.detail = nil }
+            let name = p["name"] as? String ?? t.replacingOccurrences(of: "_call", with: "")
+            let j = (p["arguments"] as? String).flatMap { json(Substring($0)) }
+            a.tool = codexToolTitle(name)
+            a.detail = j.flatMap { summarize($0) ?? ($0["cmd"] as? [String])?.joined(separator: " ") }
+            if ["sleep", "wait", "wait_agent"].contains(name) {
+                a.detail = ((j?["duration_ms"] ?? j?["timeout_ms"]) as? NSNumber).flatMap { duration($0.doubleValue / 1000) }
+            }
+            // Codex asking the user something: the turn waits on them, not on a tool.
+            if name.hasPrefix("request_user_input"), a.status != .idle { a.status = .waiting }
             a.addLog(a.tool ?? "tool", a.detail, at: when)
         case "function_call_output", "custom_tool_call_output":
             if a.status == .tool { a.status = .thinking }
