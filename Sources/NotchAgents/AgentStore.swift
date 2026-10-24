@@ -256,7 +256,9 @@ final class AgentStore: ObservableObject {
     /// later), so "finished" is only announced once Codex has stayed idle for a moment.
     private var codexDone: DispatchWorkItem?
     private var codexChainStart: Date?
-    private let io = DispatchQueue(label: "notch.io", qos: .utility)
+    // Each block drains its own autorelease pool; the default only drains when the thread goes idle, so
+    // file reads from back-to-back blocks would pile up.
+    private let io = DispatchQueue(label: "notch.io", qos: .utility, autoreleaseFrequency: .workItem)
 
     var ordered: [Agent] { AgentKind.allCases.compactMap { agents[$0] } }
     /// Agents worth listing: only the ones running now.
@@ -789,7 +791,8 @@ final class AgentStore: ObservableObject {
     /// Re-reads OpenCode's database while it runs, only when the database has changed.
     private func pollOpenCode() {
         guard let a = agents[.opencode], a.live else { openCode = nil; return }
-        let cwd = a.cwd, last = openCodeStamp
+        // The process's own folder, not the shown session's (which may be another folder's busy one).
+        let cwd = a.pid.flatMap(ProcessScanner.cwd(of:)) ?? a.cwd, last = openCodeStamp
         io.async { [weak self] in
             let stamp = OpenCodeReader.stamp()
             guard stamp != last else { return }
@@ -1319,6 +1322,8 @@ enum ProcessScanner {
     private struct PathKey: Equatable { let sec: Int; let usec: Int32; let comm: String }
     /// Executable paths from the last scan. Only touched from the store's io queue.
     nonisolated(unsafe) private static var pathCache: [Int32: (key: PathKey, path: String)] = [:]
+    nonisolated(unsafe) private static var candidates: [String: Bool] = [:]
+    nonisolated(unsafe) private static var argsCache: [Int32: (key: PathKey, at: Date, args: String?)] = [:]
 
     /// One process's kernel record, or nil once it has exited.
     private static func info(_ pid: Int32) -> kinfo_proc? {
@@ -1422,11 +1427,29 @@ enum ProcessScanner {
         resumed = resumed.filter { parent[$0.key] != nil }
         // Full command lines only for the processes that could be agents.
         let names = signatures.reduce(into: Set<String>()) { $0.formUnion($1.names) }
-        let wanted = comm.filter { let b = base($0.value)
-            return b == "claude" || b.lowercased() == "codex" || isRuntime($0.value) || names.contains(b) || $0.value.contains("claude")
+        // Both are fixed for the life of an executable, so they're worked out once per process.
+        if candidates.count > 4096 { candidates = [:] }
+        let wanted = comm.filter { pid, path in
+            if let w = candidates[path] { return w }
+            let b = base(path)
+            let w = b == "claude" || b.lowercased() == "codex" || isRuntime(path) || names.contains(b) || path.contains("claude")
+            candidates[path] = w
+            return w
         }.map(\.key)
-        var args: [Int32: String] = [:]
-        for pid in wanted { args[pid] = Self.args(of: pid) }
+        // A process can rewrite its own command line (Node's process.title), so arguments are re-read
+        // every few seconds rather than kept for good.
+        let now = Date()
+        var args: [Int32: String] = [:], argsNow: [Int32: (key: PathKey, at: Date, args: String?)] = [:]
+        for pid in wanted {
+            guard let key = pathCache[pid]?.key else { args[pid] = Self.args(of: pid); continue }
+            if let c = argsCache[pid], c.key == key, now.timeIntervalSince(c.at) < 6 {
+                args[pid] = c.args; argsNow[pid] = c; continue
+            }
+            let a = Self.args(of: pid)
+            args[pid] = a
+            argsNow[pid] = (key, now, a)
+        }
+        argsCache = argsNow
         let claude = Set(wanted.filter { isClaude(comm: comm[$0] ?? "", args: args[$0]) })
         func ancestors(_ pid: Int32) -> [String] {
             var out: [String] = [], cur = parent[pid] ?? 1

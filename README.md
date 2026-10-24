@@ -83,7 +83,7 @@ Start a new Claude Code session after installing so it picks up the hooks.
 
 Because you build the app yourself, macOS doesn't quarantine it and Gatekeeper won't block it.
 
-To package a release, `./make_dmg.sh` builds `dist/NotchAgents-<version>.dmg` (debug symbols stripped, ad-hoc signed).
+To package a release, `./make_dmg.sh` builds `dist/NotchAgents-<version>.dmg` (debug symbols stripped, ad-hoc signed). The DMG window layout is written by [dmgbuild](https://github.com/dmgbuild/dmgbuild), installed on first run into `build/dmgbuild-venv` from the hash-pinned `tools/dmg-requirements.txt`, rather than by scripting Finder, so the image records nothing about the machine that built it.
 
 ## Using it
 

@@ -7,7 +7,19 @@ enum ClaudeDirs {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var learned = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
 
+    /// Listing the home folder on every lookup cost more than anything else in a scan, and config
+    /// folders rarely come and go, so the list is reused for a few seconds.
+    nonisolated(unsafe) private static var cached: (at: Date, dirs: [URL])?
+
     static var all: [URL] {
+        lock.lock(); let c = cached; lock.unlock()
+        if let c, Date().timeIntervalSince(c.at) < 10 { return c.dirs }
+        let dirs = list()
+        lock.lock(); cached = (Date(), dirs); lock.unlock()
+        return dirs
+    }
+
+    private static func list() -> [URL] {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser
         var paths: Set<String> = [home.appendingPathComponent(".claude").path]
@@ -33,6 +45,7 @@ enum ClaudeDirs {
         let path = (d as NSString).standardizingPath
         lock.lock(); defer { lock.unlock() }
         guard learned.insert(path).inserted else { return }
+        cached = nil
         UserDefaults.standard.set(Array(learned), forKey: key)
     }
 
@@ -99,21 +112,27 @@ final class UsageLedger: @unchecked Sendable {
         if size < f.offset { f = File() }  // rewritten
         guard size > f.offset else { files[path] = f; return }
         // Read in bounded chunks: a first pass over a transcript of hundreds of megabytes would
-        // otherwise hold all of it in memory at once.
-        while f.offset < size {
-            try? h.seek(toOffset: f.offset)
-            let data = h.readData(ofLength: Int(min(size - f.offset, UInt64(Self.chunk))))
-            guard let lastNL = data.lastIndex(of: 0x0A) else {
-                // A single line longer than a chunk (a huge tool result): skip past it.
-                if data.count == Self.chunk { f.offset += UInt64(data.count); continue }
-                break
+        // otherwise hold all of it in memory at once. Each chunk gets its own autorelease pool, as
+        // this runs on a queue whose pool only drains when the whole pass is done.
+        var more = true
+        while more, f.offset < size {
+            more = autoreleasepool {
+                try? h.seek(toOffset: f.offset)
+                let data = h.readData(ofLength: Int(min(size - f.offset, UInt64(Self.chunk))))
+                guard let lastNL = data.lastIndex(of: 0x0A) else {
+                    // A single line longer than a chunk (a huge tool result): skip past it.
+                    guard data.count == Self.chunk else { return false }
+                    f.offset += UInt64(data.count)
+                    return true
+                }
+                f.offset += UInt64(lastNL - data.startIndex + 1)
+                scan(data[..<lastNL], into: &f)
+                return true
             }
-            f.offset += UInt64(lastNL - data.startIndex + 1)
-            scan(data[..<lastNL], into: &f)
         }
         files[path] = f
     }
-    private static let chunk = 8 << 20
+    private static let chunk = 4 << 20
 
     private func scan(_ data: Data, into f: inout File) {
         for line in Self.lines(in: data, containing: "\"usage\":{") {

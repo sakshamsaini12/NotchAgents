@@ -23,19 +23,30 @@ enum OpenCodeReader {
     /// A turn whose last write is older than this was abandoned (OpenCode quit mid-turn).
     private static let staleAfter: TimeInterval = 600
 
+    /// `opencode.db`, or a channel's own `opencode-<channel>.db` (preview builds keep theirs apart):
+    /// whichever was written last.
     static var database: URL {
         let env = ProcessInfo.processInfo.environment["XDG_DATA_HOME"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
-        let data = env ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share")
-        return data.appendingPathComponent("opencode/opencode.db")
+        let dir = (env ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/share"))
+            .appendingPathComponent("opencode")
+        let dbs = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasPrefix("opencode") && $0.hasSuffix(".db") }
+            .map { dir.appendingPathComponent($0) }
+        return dbs.max { written($0.path) < written($1.path) } ?? dir.appendingPathComponent("opencode.db")
+    }
+
+    private static func written(_ db: String) -> Date {
+        [db, db + "-wal"].compactMap { try? FileManager.default.attributesOfItem(atPath: $0)[.modificationDate] as? Date }.max() ?? .distantPast
     }
 
     /// Last-modified time of the database or its write-ahead log, whichever is newer: changes when OpenCode writes.
     static func stamp() -> Date? {
-        let db = database.path
-        return [db, db + "-wal"].compactMap { try? FileManager.default.attributesOfItem(atPath: $0)[.modificationDate] as? Date }.max()
+        let d = written(database.path)
+        return d == .distantPast ? nil : d
     }
 
-    /// The newest top-level session, preferring one in `cwd` (the running process's folder).
+    /// The top-level session to show: one with a turn in progress (in a TUI, `opencode run`, or an app
+    /// hosting OpenCode), else the newest in `cwd` (the running process's folder), else the newest.
     static func read(cwd: String?) -> OpenCodeSnapshot? {
         var db: OpaquePointer?
         guard sqlite3_open_v2(database.path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
@@ -47,8 +58,11 @@ enum OpenCodeReader {
         guard let session = rows(db, """
             SELECT id, directory, model, cost, tokens_output, time_updated FROM session
             WHERE parent_id IS NULL AND time_archived IS NULL
-            ORDER BY (directory = ?1) DESC, time_updated DESC LIMIT 1
-            """, [cwd ?? ""]).first, let sid = session[0] else { return nil }
+            ORDER BY (time_updated > ?2 AND (
+                SELECT json_extract(m.data, '$.role') = 'user' OR json_extract(m.data, '$.time.completed') IS NULL
+                FROM message m WHERE m.session_id = session.id ORDER BY m.time_created DESC LIMIT 1)) DESC,
+              (directory = ?1) DESC, time_updated DESC LIMIT 1
+            """, [cwd ?? "", String(Int((Date().timeIntervalSince1970 - staleAfter) * 1000))]).first, let sid = session[0] else { return nil }
 
         var snap = OpenCodeSnapshot()
         snap.cwd = session[1]

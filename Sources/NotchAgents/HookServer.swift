@@ -56,7 +56,7 @@ final class HookServer {
     /// true once listening, false if the port couldn't be bound (e.g. another copy is running).
     var onState: ((Bool) -> Void)?
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "notch.hooks")
+    private let queue = DispatchQueue(label: "notch.hooks", autoreleaseFrequency: .workItem)
 
     func start(port: UInt16 = 47823) {
         _ = Self.token
