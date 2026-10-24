@@ -43,11 +43,24 @@ Only agents that are running appear in the notch and the menu bar. The agents in
 
 ## Install
 
+NotchAgents isn't notarized by Apple yet (that needs a paid Apple developer account), so pick whichever of these you're comfortable with. All three install the same app.
+
+### Quick install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sakshamsaini12/NotchAgents/main/install.sh | bash
+```
+
+[`install.sh`](install.sh) is short; read it first if you like. It downloads the DMG from this repo's releases, **refuses to install it unless its SHA-256 matches the checksum written in the script**, checks the app's code signature, copies it to `/Applications` and opens it. It needs no password and changes no system settings. Files downloaded with `curl` aren't quarantined, so macOS doesn't show the "not opened" warning.
+
+Then click the orb in the menu bar → **Install Claude Code hooks**, and start a new Claude Code session.
+
 ### Download (DMG)
 
-1. Download `NotchAgents-<version>.dmg` from [Releases](https://github.com/sakshamsaini12/notchagents/releases) and drag NotchAgents into Applications.
-2. The app isn't notarized yet, so macOS blocks the first launch. Open it once, dismiss the warning, then go to **System Settings → Privacy & Security** and click **Open Anyway**. You only need to do this once.
-3. Click the orb in the menu bar, then **Install Claude Code hooks**. Start a new Claude Code session afterwards.
+1. Download `NotchAgents-<version>.dmg` from [Releases](https://github.com/sakshamsaini12/notchagents/releases). You can compare its SHA-256 (`shasum -a 256 NotchAgents-*.dmg`) with the one in the release notes.
+2. Drag NotchAgents into Applications.
+3. macOS blocks the first launch of apps that aren't notarized. Open it once, dismiss the warning, then go to **System Settings → Privacy & Security** and click **Open Anyway**. (Or, in Terminal: `xattr -dr com.apple.quarantine /Applications/NotchAgents.app`.) You only need to do this once.
+4. Click the orb in the menu bar → **Install Claude Code hooks**, and start a new Claude Code session.
 
 ### Build from source
 
@@ -100,10 +113,15 @@ printf '%s' "$input" | /path/to/your-statusline.sh
 
 ## Privacy and security
 
+NotchAgents is local only. There's no account, no analytics, no crash reporting and no update check: **the app never connects to the internet**. You can check this in the source; the only network code is the local server in [`HookServer.swift`](Sources/NotchAgents/HookServer.swift).
+
 - Everything runs on your Mac. NotchAgents listens only on `127.0.0.1:47823`, and requests must carry a random token stored in `~/.notchagents/token` (readable only by you). The hook scripts read the token from a file rather than passing it on the command line, so other users on the Mac can't see it in `ps`.
 - It reads Claude Code transcripts (`~/.claude*/projects`), Codex session logs (`~/.codex/sessions`, `~/.codex/archived_sessions`) and OpenCode's database (`~/.local/share/opencode/opencode.db`, opened read-only) to show activity and usage. It doesn't send them anywhere.
 - It doesn't run or modify your agents. The only action it takes is answering a permission or question when you click, and stopping a turn when you confirm Stop.
-- The hook scripts exit immediately if the app isn't running, so Claude Code is never slowed down or blocked.
+- The hook scripts exit immediately if the app isn't running, so Claude Code is never slowed down or blocked. They send Claude Code's hook data (the event, the tool and its input, the session's transcript path) to the app on `127.0.0.1` and nowhere else.
+- It asks for no macOS permissions: no Accessibility, Screen Recording, Full Disk Access, contacts or location.
+- What it writes: `~/.notchagents/` (the hook scripts and the token), the hooks entry in your Claude `settings.json` files (backed up first, and only when you install the hooks), and its preferences (`local.notchagents`: the sound switch and which Claude config folders it has seen).
+- The app is open source and built in the open: the release DMG is ad-hoc signed (no developer identity), with debug symbols stripped. If you'd rather not trust a download at all, build it yourself with `./build.sh`.
 
 ## Uninstall
 

@@ -128,7 +128,7 @@ final class HookServer {
             guard let colon = l.firstIndex(of: ":") else { continue }
             headers[l[..<colon].lowercased()] = l[l.index(after: colon)...].trimmingCharacters(in: .whitespaces)
         }
-        let length = Int(headers["content-length"] ?? "") ?? 0
+        let length = max(0, Int(headers["content-length"] ?? "") ?? 0)
         let token = headers["x-notch-token"] ?? ""
         let body = buf[sep.upperBound...]
         guard body.count >= length else { return nil }

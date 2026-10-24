@@ -11,9 +11,14 @@ if [ -d /Volumes/NotchAgents ]; then echo "Eject the mounted NotchAgents disk im
 
 ./build.sh --app-only
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" build/NotchAgents.app/Contents/Info.plist)
-WORK=$(mktemp -d)
-MNT="$WORK/mnt"
-trap 'hdiutil detach "$MNT" -force >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+# Finder records where the image and its mount were (paths and disk ids) in the window layout it stores
+# on the disk. So the work happens on a throwaway RAM disk with a fresh id, mounted at a neutral path:
+# nothing in the DMG points back at the machine that built it.
+MNT=/Volumes/NotchAgents
+RAM=$(hdiutil attach -nomount ram://1048576 | awk '{print $1}')   # 512 MB
+WORK=/Volumes/NotchAgentsBuild
+diskutil quiet erasevolume HFS+ NotchAgentsBuild "$RAM"
+trap 'hdiutil detach "$MNT" -force >/dev/null 2>&1 || true; hdiutil detach "$RAM" -force >/dev/null 2>&1 || true' EXIT
 
 # Background art, drawn by the app itself at 1× and 2×, packed into one Retina-aware TIFF.
 mkdir -p "$WORK/stage/.background"
@@ -24,8 +29,8 @@ ln -s /Applications "$WORK/stage/Applications"
 
 # Writable image first, so Finder can store the window layout in it.
 hdiutil create -volname NotchAgents -srcfolder "$WORK/stage" -fs HFS+ -format UDRW -ov "$WORK/rw.dmg" >/dev/null
-mkdir -p "$MNT"
-hdiutil attach "$WORK/rw.dmg" -mountpoint "$MNT" -noautoopen >/dev/null
+hdiutil attach "$WORK/rw.dmg" -noautoopen >/dev/null
+[ -d "$MNT" ] || { echo "The image didn't mount at $MNT."; exit 1; }
 osascript <<OSA
 tell application "Finder"
   set d to (POSIX file "$MNT" as alias)
@@ -56,4 +61,7 @@ mkdir -p dist
 DMG="dist/NotchAgents-$VERSION.dmg"
 rm -f "$DMG"
 hdiutil convert "$WORK/rw.dmg" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null
-shasum -a 256 "$DMG"
+SUM=$(shasum -a 256 "$DMG" | awk '{print $1}')
+# install.sh only installs a download whose checksum matches the one it carries.
+sed -i '' -e "s/^VERSION=.*/VERSION=$VERSION/" -e "s/^SHA256=.*/SHA256=$SUM/" install.sh
+echo "$SUM  $DMG"
