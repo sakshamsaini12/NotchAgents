@@ -98,11 +98,25 @@ final class UsageLedger: @unchecked Sendable {
         let size = (try? h.seekToEnd()) ?? 0
         if size < f.offset { f = File() }  // rewritten
         guard size > f.offset else { files[path] = f; return }
-        try? h.seek(toOffset: f.offset)
-        let data = h.readDataToEndOfFile()
-        guard let lastNL = data.lastIndex(of: 0x0A) else { files[path] = f; return }
-        f.offset += UInt64(lastNL - data.startIndex + 1)
-        for line in Self.lines(in: data[..<lastNL], containing: "\"usage\":{") {
+        // Read in bounded chunks: a first pass over a transcript of hundreds of megabytes would
+        // otherwise hold all of it in memory at once.
+        while f.offset < size {
+            try? h.seek(toOffset: f.offset)
+            let data = h.readData(ofLength: Int(min(size - f.offset, UInt64(Self.chunk))))
+            guard let lastNL = data.lastIndex(of: 0x0A) else {
+                // A single line longer than a chunk (a huge tool result): skip past it.
+                if data.count == Self.chunk { f.offset += UInt64(data.count); continue }
+                break
+            }
+            f.offset += UInt64(lastNL - data.startIndex + 1)
+            scan(data[..<lastNL], into: &f)
+        }
+        files[path] = f
+    }
+    private static let chunk = 8 << 20
+
+    private func scan(_ data: Data, into f: inout File) {
+        for line in Self.lines(in: data, containing: "\"usage\":{") {
             guard let o = AgentStore.json(line), let m = o["message"] as? [String: Any], let u = m["usage"] as? [String: Any],
                   let model = m["model"] as? String else { continue }
             if f.desktop == nil, let e = o["entrypoint"] as? String { f.desktop = e == "claude-desktop" }
@@ -114,7 +128,6 @@ final class UsageLedger: @unchecked Sendable {
             f.cost += c
             f.byDay[Self.day(when), default: 0] += c
         }
-        files[path] = f
     }
 
     /// The lines of `data` that contain `needle`, found with a byte search. Transcripts run to hundreds of

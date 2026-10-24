@@ -82,13 +82,15 @@ struct AgentGlyph: View {
     var size: CGFloat = 18
 
     var body: some View {
-        // Idle orbs only drift slowly, so a low frame rate looks the same and costs a fraction;
-        // the canvas renders off the main thread.
-        let fps: Double = !(status.isBusy || status == .waiting) ? 12 : size < 30 ? 30 : 60
+        // Idle orbs only drift slowly, so a low frame rate looks the same and costs a fraction. The
+        // swirl's blurs and gradients are composited on the GPU; drawn on the CPU they were most of the
+        // app's CPU time.
+        let fps: Double = status.isBusy || status == .waiting ? 30 : 12
         TimelineView(.animation(minimumInterval: 1 / fps, paused: status == .offline)) { tl in
             Canvas(rendersAsynchronously: true) { ctx, sz in
                 OrbPainter(kind: kind, status: status, t: tl.date.timeIntervalSinceReferenceDate).draw(&ctx, sz)
             }
+            .drawingGroup()
         }
         .frame(width: size, height: size)
         // Coloured glow beneath, drawn outside the canvas so it never clips to a square.

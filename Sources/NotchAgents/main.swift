@@ -55,7 +55,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.start()
         menuBar = MenuBarController(store: store)
 
-        let track: (NSEvent) -> Void = { [weak self] _ in self?.trackMouse() }
+        // Mouse moves arrive at up to the display's refresh rate (120 Hz on ProMotion); hit-testing at
+        // most once per frame of the slower 60 Hz is indistinguishable and halves the work.
+        var lastTrack = Date.distantPast
+        let track: (NSEvent) -> Void = { [weak self] _ in
+            let now = Date()
+            guard now.timeIntervalSince(lastTrack) >= 1.0 / 60 else { return }
+            lastTrack = now
+            self?.trackMouse()
+        }
         monitors.append(NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged], handler: track) as Any)
         monitors.append(NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { e in track(e); return e } as Any)
         // ⌘Y / ⌘N answer a pending permission while the island is open (the panel is key only then).
@@ -117,9 +125,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let p = NSEvent.mouseLocation
         BotMood.pointer = p
         BotMood.origin = CGPoint(x: screen.frame.midX, y: screen.frame.maxY - model.notch.height / 2)
-        BotMood.liveOrder = store.liveAgents.map(\.kind)
-        for a in store.liveAgents { BotMood.tools[a.kind] = a.tool ?? "" }
+        let live = store.liveAgents
+        BotMood.liveOrder = live.map(\.kind)
+        for a in live { BotMood.tools[a.kind] = a.tool ?? "" }
         let f = screen.frame
+        // Far below the island with nothing to undo: the hit test can't come out differently.
+        if !Self.pinOpen, p.y < f.maxY - IslandModel.maxSize.height - 40, !model.hovering, hoverWork == nil,
+           panel.ignoresMouseEvents, !panel.isKeyWindow, !store.alertHeld { return }
         let current = model.size(store)
         if Self.pinOpen {
             if !model.hovering { model.hovering = true; DispatchQueue.main.async { self.model.revealed = true } }

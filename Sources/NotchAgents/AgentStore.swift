@@ -1158,19 +1158,29 @@ final class AgentStore: ObservableObject {
     /// Who wrote a Claude transcript, from the `entrypoint` its entries carry: "claude-desktop" for the
     /// Claude app, "cli", an editor extension, or "sdk-…". nil until the first entry is written.
     nonisolated static func transcriptEntrypoint(_ path: String) -> String? {
+        let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? NSNumber)?.intValue ?? 0
         entrypointLock.lock(); let cached = entrypointCache[path]; entrypointLock.unlock()
-        if let cached { return cached }
+        // A file without one is only read again once it has grown, and never once its head is full.
+        switch cached {
+        case .found(let e)?: return e
+        case .missing(let at)? where at == size || at >= headBytes: return nil
+        default: break
+        }
         guard let h = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? h.close() }
-        let head = String(decoding: h.readData(ofLength: 256 * 1024), as: UTF8.self)
-        guard let r = head.range(of: "\"entrypoint\":\""),
-              let end = head[r.upperBound...].firstIndex(of: "\"") else { return nil }
-        let e = String(head[r.upperBound..<end])
-        entrypointLock.lock(); entrypointCache[path] = e; entrypointLock.unlock()
+        let data = h.readData(ofLength: headBytes)
+        let head = String(decoding: data, as: UTF8.self)
+        var e: String?
+        if let r = head.range(of: "\"entrypoint\":\""), let end = head[r.upperBound...].firstIndex(of: "\"") {
+            e = String(head[r.upperBound..<end])
+        }
+        entrypointLock.lock(); entrypointCache[path] = e.map { .found($0) } ?? .missing(data.count); entrypointLock.unlock()
         return e
     }
+    private enum Entrypoint { case found(String), missing(Int) }
+    nonisolated private static let headBytes = 256 * 1024
     nonisolated static func isDesktopTranscript(_ path: String) -> Bool { transcriptEntrypoint(path) == "claude-desktop" }
-    nonisolated(unsafe) private static var entrypointCache: [String: String] = [:]
+    nonisolated(unsafe) private static var entrypointCache: [String: Entrypoint] = [:]
     nonisolated private static let entrypointLock = NSLock()
 
     nonisolated static func json(_ s: Substring) -> [String: Any]? {
@@ -1227,16 +1237,22 @@ final class AgentStore: ObservableObject {
         return (subagent, probe)
     }
     /// The newest plan-usage report in a Codex log's tail.
-    nonisolated static func codexLimits(in url: URL) -> (fiveHour: Double?, week: Double?, reset5h: Date?, resetWeek: Date?, at: Date)? {
-        guard let lines = tailLines(url.path, bytes: 256 * 1024) else { return nil }
-        for line in lines.reversed() where line.contains("\"rate_limits\"") {
+    nonisolated static func codexLimits(in url: URL) -> CodexLimits? {
+        // Re-read only when the log has changed since the last look.
+        let m = mtime(url)
+        if let c = codexLimitsCache[url.path], c.mtime == m { return c.limits }
+        var found: CodexLimits?
+        for line in (tailLines(url.path, bytes: 256 * 1024) ?? []).reversed() where line.contains("\"rate_limits\"") {
             guard let o = json(line) else { continue }
             var a = Agent(kind: .codex)
             applyCodex(o, to: &a)
-            if let at = a.limitsAt { return (a.limit5h, a.limitWeek, a.reset5h, a.resetWeek, at) }
+            if let at = a.limitsAt { found = (a.limit5h, a.limitWeek, a.reset5h, a.resetWeek, at); break }
         }
-        return nil
+        codexLimitsCache[url.path] = (m, found)
+        return found
     }
+    typealias CodexLimits = (fiveHour: Double?, week: Double?, reset5h: Date?, resetWeek: Date?, at: Date)
+    nonisolated(unsafe) private static var codexLimitsCache: [String: (mtime: Date, limits: CodexLimits?)] = [:]
     nonisolated(unsafe) private static var codexMetaCache: [String: (subagent: Bool, probe: Bool)] = [:]
 
     nonisolated static func newestFile(in root: URL, ext: String, depth: Int) -> URL? {
@@ -1281,20 +1297,28 @@ enum ProcessScanner {
 
         var parent: [Int32: Int32] = [:], comm: [Int32: String] = [:], tty: [Int32: Bool] = [:], stopped: Set<Int32> = []
         var path = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+        var paths: [Int32: (key: PathKey, path: String)] = [:]
         for p in procs {
             let pid = p.kp_proc.p_pid
             // Suspended (Ctrl-Z) or exited-but-unreaped: present, but not running anything.
             if p.kp_proc.p_stat == SSTOP || p.kp_proc.p_stat == SZOMB { stopped.insert(pid) }
             parent[pid] = p.kp_eproc.e_ppid
             tty[pid] = p.kp_eproc.e_tdev != -1
-            if proc_pidpath(pid, &path, UInt32(path.count)) > 0 {
-                comm[pid] = String(cString: path)
-            } else {
-                comm[pid] = withUnsafeBytes(of: p.kp_proc.p_comm) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
-            }
+            let short = withUnsafeBytes(of: p.kp_proc.p_comm) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+            // A process's executable only changes when it execs, which also changes its short name, so
+            // the path is looked up once per process instead of for every process on every scan.
+            let key = PathKey(sec: p.kp_proc.p_starttime.tv_sec, usec: p.kp_proc.p_starttime.tv_usec, comm: short)
+            if let c = pathCache[pid], c.key == key { paths[pid] = c; comm[pid] = c.path; continue }
+            let full = proc_pidpath(pid, &path, UInt32(path.count)) > 0 ? String(cString: path) : short
+            paths[pid] = (key, full)
+            comm[pid] = full
         }
+        pathCache = paths
         return (parent, comm, tty, stopped)
     }
+    private struct PathKey: Equatable { let sec: Int; let usec: Int32; let comm: String }
+    /// Executable paths from the last scan. Only touched from the store's io queue.
+    nonisolated(unsafe) private static var pathCache: [Int32: (key: PathKey, path: String)] = [:]
 
     /// One process's kernel record, or nil once it has exited.
     private static func info(_ pid: Int32) -> kinfo_proc? {
