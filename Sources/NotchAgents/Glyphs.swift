@@ -8,13 +8,8 @@ extension AgentKind {
         case .claudeCLI: [Color(hex: 0xFF9A4D), Color(hex: 0xE8641C), Color(hex: 0x9E3209), Color(hex: 0xFFD9B8)]
         case .claudeApp: [Color(hex: 0xFFC27A), Color(hex: 0xF49530), Color(hex: 0xB5560F), Color(hex: 0xFFEBCF)]
         case .codex: [Color(hex: 0x7FD0FF), Color(hex: 0x4A5CFF), Color(hex: 0x2A2FC0), Color(hex: 0x9BF0FF)]
-        // Process-detected agents: each its own hue, clear of Claude's orange and Codex's blue.
+        // OpenCode: white, clear of Claude's orange and Codex's blue.
         case .opencode: [Color(hex: 0xF2F4F7), Color(hex: 0xB0BAC6), Color(hex: 0x56616E), Color(hex: 0xFFFFFF)]
-        case .cursor: [Color(hex: 0xC9C2FF), Color(hex: 0x8C7CFF), Color(hex: 0x4B3BC4), Color(hex: 0xEDE9FF)]
-        case .gemini: [Color(hex: 0xF29BD8), Color(hex: 0xB86BF0), Color(hex: 0x6A35B8), Color(hex: 0xFFD6F3)]
-        case .copilot: [Color(hex: 0xE2F57A), Color(hex: 0xB4D82E), Color(hex: 0x6C8A10), Color(hex: 0xF6FFC8)]
-        case .amp: [Color(hex: 0xFF8A8A), Color(hex: 0xF0453F), Color(hex: 0x9E1C18), Color(hex: 0xFFD3D1)]
-        case .aider: [Color(hex: 0x9BF59B), Color(hex: 0x3FCF5A), Color(hex: 0x1D7A2E), Color(hex: 0xD8FFD8)]
         }
     }
 }

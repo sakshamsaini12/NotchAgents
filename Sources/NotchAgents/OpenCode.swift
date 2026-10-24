@@ -17,6 +17,14 @@ struct OpenCodeSnapshot: Equatable {
     var turnStart: Date?
     /// Newest first, at most 4.
     var steps: [Step] = []
+    /// A question OpenCode is waiting on you to answer: its tool call id and `questions` input.
+    var question: (id: String, items: [PendingQuestion.Item])?
+
+    static func == (a: Self, b: Self) -> Bool {
+        a.status == b.status && a.tool == b.tool && a.detail == b.detail && a.model == b.model && a.cwd == b.cwd
+            && a.cost == b.cost && a.tokens == b.tokens && a.turnStart == b.turnStart && a.steps == b.steps
+            && a.question?.id == b.question?.id
+    }
 }
 
 enum OpenCodeReader {
@@ -67,8 +75,14 @@ enum OpenCodeReader {
         var snap = OpenCodeSnapshot()
         snap.cwd = session[1]
         snap.model = session[2].flatMap(json).flatMap { $0["id"] as? String }
-        snap.cost = session[3].flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil }
-        snap.tokens = session[4].flatMap { Int($0) } ?? 0
+        // Output includes reasoning (as Claude's output count includes thinking), and subagent work runs
+        // in child sessions, so both count toward the session the user started.
+        let totals = rows(db, """
+            WITH RECURSIVE tree(id) AS (SELECT ?1 UNION ALL SELECT s.id FROM session s JOIN tree ON s.parent_id = tree.id)
+            SELECT SUM(cost), SUM(tokens_output + tokens_reasoning) FROM session WHERE id IN tree
+            """, [sid]).first
+        snap.cost = (totals?[0] ?? session[3]).flatMap(Double.init).flatMap { $0 > 0 ? $0 : nil }
+        snap.tokens = (totals?[1] ?? session[4]).flatMap { Int($0) } ?? 0
         let updated = date(session[5])
 
         let last = rows(db, "SELECT data FROM message WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 1", [sid])
@@ -99,11 +113,19 @@ enum OpenCodeReader {
             if snap.steps.count == 4 { break }
         }
 
+        // OpenCode's question tool runs until you answer it.
+        if busy, let (p, _) = parts.first, p["tool"] as? String == "question",
+           let state = p["state"] as? [String: Any], state["status"] as? String == "running",
+           let input = state["input"] as? [String: Any] {
+            let items = PendingQuestion.items(input)
+            if PendingQuestion.answerable(items) { snap.question = (p["callID"] as? String ?? "", items) }
+        }
+
         if busy {
             snap.turnStart = prompt
             if let newest = parts.first, newest.part["type"] as? String == "tool",
                let step = snap.steps.first, !step.done {
-                snap.status = .tool; snap.tool = step.tool; snap.detail = step.detail
+                snap.status = snap.question != nil ? .waiting : .tool; snap.tool = step.tool; snap.detail = step.detail
             } else {
                 snap.status = .thinking
             }

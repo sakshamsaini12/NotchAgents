@@ -47,6 +47,49 @@ final class IslandModel: ObservableObject {
     @Published var qPicks: [Int: [String]] = [:]
     var qID: UUID?
 
+    /// Picks option `index` of the question's current item, from a click or the 1–9 keys. A single-choice
+    /// item moves straight on (or submits, on the last one); a multi-select item toggles the option.
+    func pick(_ index: Int, in q: PendingQuestion, store: AgentStore) {
+        startQuestion(q)
+        guard !q.items.isEmpty else { return }
+        let step = min(qStep, q.items.count - 1), item = q.items[step]
+        guard item.options.indices.contains(index) else { return }
+        // Only the agent itself can take this answer (OpenCode, or Claude before its request arrives).
+        guard q.answer != nil else { store.answer(nil); return }
+        let label = item.options[index].label
+        if item.multi {
+            var p = qPicks[step] ?? []
+            if let i = p.firstIndex(of: label) { p.remove(at: i) } else { p.append(label) }
+            qPicks[step] = p
+            SFX.play(.tap)
+        } else {
+            qPicks[step] = [label]
+            advance(q, store: store)
+        }
+    }
+
+    /// Next item, or send every answer after the last one. Multi-select items need a pick first.
+    func advance(_ q: PendingQuestion, store: AgentStore) {
+        startQuestion(q)
+        guard !q.items.isEmpty else { return }
+        let step = min(qStep, q.items.count - 1)
+        guard !(qPicks[step] ?? []).isEmpty else { return }
+        if step + 1 < q.items.count {
+            withAnimation(.smooth(duration: 0.3)) { qStep = step + 1 }
+            return
+        }
+        var answers: [String: String] = [:]
+        for (i, it) in q.items.enumerated() { answers[it.question] = (qPicks[i] ?? []).joined(separator: ", ") }
+        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
+        store.answer(answers)
+    }
+
+    /// Fresh progress for a question not seen before.
+    func startQuestion(_ q: PendingQuestion) {
+        guard qID != q.id else { return }
+        qID = q.id; qStep = 0; qPicks = [:]
+    }
+
     /// Largest size the island can reach; the panel is sized from this.
     static let maxSize = CGSize(width: 620, height: 340)
     static let wing: CGFloat = 54
@@ -103,6 +146,22 @@ enum Ink {
 }
 
 struct IslandView: View {
+    /// The working glow's colours: four per working agent family, interleaved. Both Claudes share one.
+    static func workLight(_ kinds: [AgentKind]) -> [Color] {
+        var seen = Set<AgentKind>(), palettes: [[Color]] = []
+        for k in AgentKind.allCases where kinds.contains(k) {
+            let family: AgentKind = k.isClaude ? .claudeCLI : k
+            guard seen.insert(family).inserted else { continue }
+            switch family {
+            case .claudeCLI: palettes.append([Color(hex: 0xFF5A1F), Color(hex: 0xFF9A3C), Color(hex: 0xFF4F6E), Color(hex: 0xFFB36B)])
+            case .codex: palettes.append([Color(hex: 0x2F6BFF), Color(hex: 0x36D1FF), Color(hex: 0x8A5CFF), Color(hex: 0x9BE9FF)])
+            case .opencode: palettes.append([Color(hex: 0xFFFFFF), Color(hex: 0xC9D3DE), Color(hex: 0xF2F4F7), Color(hex: 0x9FB0C2)])
+            default: let g = family.gradient; palettes.append([g[0], g[1], g[3], g[0]])
+            }
+        }
+        return (0..<4).flatMap { i in palettes.map { $0[i] } }
+    }
+
     @ObservedObject var store: AgentStore
     @ObservedObject var model: IslandModel
     @Namespace private var ns
@@ -114,13 +173,9 @@ struct IslandView: View {
         let big = mode == .expanded || mode == .alert || mode == .question
         let shape = NotchShape(topRadius: big ? 14 : 6, bottomRadius: expanded ? 30 : big ? 24 : model.notch.height * 0.36)
         let lead = store.alert?.kind ?? store.liveAgents.first(where: { $0.status.isBusy })?.kind ?? store.liveAgents.first?.kind
-        // Orange while Claude works, blue while Codex works, both woven together when both do.
-        let working = Set(store.liveAgents.filter(\.status.isBusy).map { $0.kind == .codex })
-        let claudeLight = [Color(hex: 0xFF5A1F), Color(hex: 0xFF9A3C), Color(hex: 0xFF4F6E), Color(hex: 0xFFB36B)]
-        let codexLight = [Color(hex: 0x2F6BFF), Color(hex: 0x36D1FF), Color(hex: 0x8A5CFF), Color(hex: 0x9BE9FF)]
-        let workColors: [Color] = working.count == 2
-            ? zip(claudeLight, codexLight).flatMap { [$0, $1] }
-            : working.contains(false) ? claudeLight : working.contains(true) ? codexLight : []
+        // Each working agent's light, woven together when several work at once: orange for Claude,
+        // blue for Codex, white for OpenCode, and so on.
+        let workColors = Self.workLight(store.liveAgents.filter(\.status.isBusy).map(\.kind))
         let leadPalette = store.question != nil ? amberPalette : store.alert.map { $0.style == .question ? amberPalette : $0.kind.gradient } ?? lead?.gradient
 
         ZStack(alignment: .top) {
@@ -435,7 +490,7 @@ private struct QuestionContent: View {
 
                 VStack(spacing: 4) {
                     ForEach(Array(item.options.enumerated()), id: \.offset) { i, o in
-                        Button { pick(o.label, item: item, step: step, items: items) } label: {
+                        Button { model.pick(i, in: question, store: store) } label: {
                             QuestionOption(index: i + 1, option: o, selected: picks.contains(o.label), multi: item.multi)
                         }
                         .buttonStyle(.plain)
@@ -451,7 +506,7 @@ private struct QuestionContent: View {
                         }
                         Spacer()
                         if item.multi {
-                            Button(step == items.count - 1 ? "Submit" : "Next") { advance(step: step, items: items) }
+                            Button(step == items.count - 1 ? "Submit" : "Next") { model.advance(question, store: store) }
                                 .buttonStyle(GradientPill(palette: amberPalette))
                                 .disabled(picks.isEmpty).opacity(picks.isEmpty ? 0.5 : 1)
                         }
@@ -462,36 +517,8 @@ private struct QuestionContent: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 22)
-        .onAppear { reset() }
-        .onChange(of: question.id) { reset() }
-    }
-
-    private func reset() {
-        guard model.qID != question.id else { return }
-        model.qID = question.id; model.qStep = 0; model.qPicks = [:]
-    }
-
-    private func pick(_ label: String, item: PendingQuestion.Item, step: Int, items: [PendingQuestion.Item]) {
-        if item.multi {
-            var p = model.qPicks[step] ?? []
-            if let i = p.firstIndex(of: label) { p.remove(at: i) } else { p.append(label) }
-            model.qPicks[step] = p
-            SFX.play(.tap)
-        } else {
-            model.qPicks[step] = [label]
-            advance(step: step, items: items)
-        }
-    }
-
-    private func advance(step: Int, items: [PendingQuestion.Item]) {
-        if step + 1 < items.count {
-            withAnimation(.smooth(duration: 0.3)) { model.qStep = step + 1 }
-            return
-        }
-        var answers: [String: String] = [:]
-        for (i, it) in items.enumerated() { answers[it.question] = (model.qPicks[i] ?? []).joined(separator: ", ") }
-        NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .now)
-        store.answer(answers)
+        .onAppear { model.startQuestion(question) }
+        .onChange(of: question.id) { model.startQuestion(question) }
     }
 }
 

@@ -86,15 +86,20 @@ enum Pricing {
 
 /// Incremental per-transcript spend, so "Today" counts what was spent today (not the lifetime of every
 /// session touched today) and live sessions count before Claude writes a cost summary. Claude writes a
-/// message's usage once per content block, so entries are de-duplicated by message id.
+/// message's usage once per content block, so entries are de-duplicated by message id. A continued or
+/// forked session's transcript starts with a copy of the one it came from, so a message counts only
+/// for the transcript that was created first (where it was actually sent).
 /// Only touched from the store's serial io queue.
 final class UsageLedger: @unchecked Sendable {
+    private struct Message { var cost: Double; var day: Int; var output: Int }
     private struct File {
-        var offset: UInt64 = 0; var seen = Set<String>(); var byDay: [Int: Double] = [:]; var cost = 0.0; var output = 0
+        var offset: UInt64 = 0; var messages: [String: Message] = [:]; var born = Date.distantPast
         /// Written by the desktop app's Claude Code (`"entrypoint":"claude-desktop"`), not the CLI.
         var desktop: Bool?
     }
     private var files: [String: File] = [:]
+    /// Message id -> the transcript it belongs to: the earliest-created one that has it.
+    private var owner: [String: String] = [:]
     private let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
     }()
@@ -110,6 +115,9 @@ final class UsageLedger: @unchecked Sendable {
         defer { try? h.close() }
         let size = (try? h.seekToEnd()) ?? 0
         if size < f.offset { f = File() }  // rewritten
+        if f.offset == 0 {
+            f.born = ((try? FileManager.default.attributesOfItem(atPath: path)[.creationDate]) as? Date) ?? .distantPast
+        }
         guard size > f.offset else { files[path] = f; return }
         // Read in bounded chunks: a first pass over a transcript of hundreds of megabytes would
         // otherwise hold all of it in memory at once. Each chunk gets its own autorelease pool, as
@@ -126,7 +134,7 @@ final class UsageLedger: @unchecked Sendable {
                     return true
                 }
                 f.offset += UInt64(lastNL - data.startIndex + 1)
-                scan(data[..<lastNL], into: &f)
+                scan(data[..<lastNL], into: &f, path: path)
                 return true
             }
         }
@@ -134,19 +142,25 @@ final class UsageLedger: @unchecked Sendable {
     }
     private static let chunk = 4 << 20
 
-    private func scan(_ data: Data, into f: inout File) {
+    private func scan(_ data: Data, into f: inout File, path: String) {
         for line in Self.lines(in: data, containing: "\"usage\":{") {
             guard let o = AgentStore.json(line), let m = o["message"] as? [String: Any], let u = m["usage"] as? [String: Any],
                   let model = m["model"] as? String else { continue }
             if f.desktop == nil, let e = o["entrypoint"] as? String { f.desktop = e == "claude-desktop" }
             let id = (m["id"] as? String) ?? (o["requestId"] as? String) ?? (o["uuid"] as? String) ?? UUID().uuidString
-            guard f.seen.insert(id).inserted else { continue }
-            f.output += (u["output_tokens"] as? NSNumber)?.intValue ?? 0
-            guard let c = Pricing.cost(model: model, usage: u) else { continue }
+            guard f.messages[id] == nil else { continue }
             let when = (o["timestamp"] as? String).flatMap { iso.date(from: $0) } ?? Date()
-            f.cost += c
-            f.byDay[Self.day(when), default: 0] += c
+            f.messages[id] = Message(cost: Pricing.cost(model: model, usage: u) ?? 0, day: Self.day(when),
+                                     output: (u["output_tokens"] as? NSNumber)?.intValue ?? 0)
+            if let o = owner[id], o != path, let other = files[o], other.messages[id] != nil, other.born <= f.born { continue }
+            owner[id] = path
         }
+    }
+
+    /// The messages a transcript sent itself (not ones copied in from the session it continues).
+    private func own(_ path: String) -> [Message] {
+        guard let f = files[path] else { return [] }
+        return f.messages.compactMap { owner[$0.key] == path ? $0.value : nil }
     }
 
     /// The lines of `data` that contain `needle`, found with a byte search. Transcripts run to hundreds of
@@ -177,7 +191,9 @@ final class UsageLedger: @unchecked Sendable {
         var cost = 0.0, output = 0, any = false
         for p in [transcript] + subs {
             update(p)
-            if let f = files[p] { cost += f.cost; output += f.output; any = any || !f.seen.isEmpty }
+            let mine = own(p)
+            cost += mine.reduce(0) { $0 + $1.cost }; output += mine.reduce(0) { $0 + $1.output }
+            any = any || !mine.isEmpty
         }
         return any ? (cost, output) : nil
     }
@@ -199,7 +215,8 @@ final class UsageLedger: @unchecked Sendable {
         var out: [AgentKind: Double] = [:]
         for p in todayFiles {
             update(p)
-            if let f = files[p], let c = f.byDay[key] { out[f.desktop == true ? .claudeApp : .claudeCLI, default: 0] += c }
+            let c = own(p).reduce(0) { $1.day == key ? $0 + $1.cost : $0 }
+            if c > 0 { out[files[p]?.desktop == true ? .claudeApp : .claudeCLI, default: 0] += c }
         }
         return out
     }

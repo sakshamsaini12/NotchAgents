@@ -32,9 +32,8 @@ When you're not hovering, the notch stays small: one orb per running agent and t
 | **Claude App** (Claude Code sessions in the desktop app) | Hooks + process scan | Same as above |
 | **Codex** (CLI, desktop, or hosted by another app) | Codex's session logs + process scan | Status, tool activity, context, limits |
 | **OpenCode** (terminal, or hosted by another app) | Process scan + OpenCode's local database (read-only) | Status, tool activity, model, session cost and tokens |
-| **Cursor Agent CLI, Gemini CLI, Copilot CLI, Amp, Aider** | Process scan | Running or not, project folder, run time |
 
-Only agents that are running appear in the notch and the menu bar. The agents in the last row don't expose anything NotchAgents can read, so it can only see that they're running, not what they're doing. Cursor's built-in editor agent isn't visible at all; only its terminal CLI (`cursor-agent`) is.
+Only agents that are running appear in the notch and the menu bar.
 
 ## Requirements
 

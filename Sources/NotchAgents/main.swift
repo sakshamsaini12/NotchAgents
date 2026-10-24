@@ -69,10 +69,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ⌘Y / ⌘N answer a pending permission while the island is open (the panel is key only then).
         monitors.append(NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             guard let self else { return e }
-            // 1-4 pick an option of a notch question (single-question, single-select).
-            if let q = self.store.question, q.items.count == 1, !q.items[0].multi,
-               let n = Int(e.charactersIgnoringModifiers ?? ""), n >= 1, n <= q.items[0].options.count {
-                self.store.answer([q.items[0].question: q.items[0].options[n - 1].label]); return nil
+            // A notch question: 1–9 pick an option of the current item (toggle, for multi-select), Return
+            // moves on or submits, Escape hands the question back to the agent's own window.
+            if let q = self.store.question, e.modifierFlags.intersection([.command, .control, .option]).isEmpty {
+                if let n = Int(e.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9 {
+                    self.model.pick(n - 1, in: q, store: self.store); return nil
+                }
+                switch e.keyCode {
+                case 36, 76: self.model.advance(q, store: self.store); return nil   // Return, Enter
+                case 53: self.store.answer(nil); return nil                            // Escape
+                default: break
+                }
             }
             guard e.modifierFlags.contains(.command), let kind = self.store.pending?.kind else { return e }
             switch e.charactersIgnoringModifiers?.lowercased() {
@@ -184,8 +191,7 @@ enum LaunchEnvironment {
     static let claudeConfigDir = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
     static let codexHome = ProcessInfo.processInfo.environment["CODEX_HOME"]
 
-    private static let prefixes = ["CLAUDE", "ANTHROPIC_", "CODEX_", "OPENAI_", "OPENCODE", "GEMINI_",
-                                   "CURSOR_", "COPILOT_", "AMP_", "AIDER_"]
+    private static let prefixes = ["CLAUDE", "ANTHROPIC_", "CODEX_", "OPENAI_", "OPENCODE"]
 
     static func scrub() {
         _ = (claudeConfigDir, codexHome)

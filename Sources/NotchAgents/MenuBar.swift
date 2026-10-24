@@ -54,7 +54,7 @@ struct MenuBarView: View {
             if store.liveAgents.isEmpty {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("No agents running").font(.system(size: 12, weight: .medium))
-                    Text("Start Claude Code, Codex, OpenCode, Cursor Agent, Gemini CLI, Copilot CLI, Amp or Aider and it shows up here.")
+                    Text("Start Claude Code, Codex or OpenCode and it shows up here.")
                         .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
             }

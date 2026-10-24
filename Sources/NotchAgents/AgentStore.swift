@@ -3,8 +3,8 @@ import SwiftUI
 
 enum AgentKind: String, CaseIterable, Identifiable {
     case claudeCLI, claudeApp, codex
-    /// Detected from their process alone (no hooks or logs we read): live, folder and run time.
-    case opencode, cursor, gemini, copilot, amp, aider
+    /// Detected from its process, with status from its local database.
+    case opencode
     var id: String { rawValue }
 
     var title: String {
@@ -13,11 +13,6 @@ enum AgentKind: String, CaseIterable, Identifiable {
         case .claudeApp: "Claude App"
         case .codex: "Codex"
         case .opencode: "OpenCode"
-        case .cursor: "Cursor Agent"
-        case .gemini: "Gemini CLI"
-        case .copilot: "Copilot CLI"
-        case .amp: "Amp"
-        case .aider: "Aider"
         }
     }
 
@@ -51,11 +46,6 @@ enum AgentKind: String, CaseIterable, Identifiable {
         case .claudeApp: nil
         case .codex: "codex"
         case .opencode: "opencode"
-        case .cursor: "cursor-agent"
-        case .gemini: "gemini"
-        case .copilot: "copilot"
-        case .amp: "amp"
-        case .aider: "aider"
         }
     }
 }
@@ -126,7 +116,8 @@ struct PendingQuestion: Identifiable {
                  options: ((q["options"] as? [[String: Any]]) ?? []).map {
                      Option(label: $0["label"] as? String ?? "", detail: $0["description"] as? String ?? "")
                  },
-                 multi: q["multiSelect"] as? Bool ?? false)
+                 // OpenCode calls it "multiple".
+                 multi: q["multiSelect"] as? Bool ?? q["multiple"] as? Bool ?? false)
         }
     }
 
@@ -276,6 +267,7 @@ final class AgentStore: ObservableObject {
     }
 
     func start() {
+        loadLimits()
         server.onRequest = { [weak self] req, reply in self?.handleHook(req, reply: reply) }
         server.onState = { [weak self] ok in self?.serverOK = ok }
         // NOTCHAGENTS_PORT runs a second copy beside the installed one (development); hooks always use 47823.
@@ -586,12 +578,42 @@ final class AgentStore: ObservableObject {
             }
             return nil
         }
-        claudeLimits[path] = ClaudeLimits(fiveHour: pct(rl["five_hour"]), week: pct(rl["seven_day"]),
-                                          reset5h: reset(rl["five_hour"]), resetWeek: reset(rl["seven_day"]), at: Date())
+        let l = ClaudeLimits(fiveHour: pct(rl["five_hour"]), week: pct(rl["seven_day"]),
+                             reset5h: reset(rl["five_hour"]), resetWeek: reset(rl["seven_day"]), at: Date(),
+                             app: appSessions.contains(path))
+        let old = claudeLimits[path]
+        claudeLimits[path] = l
         for k in [AgentKind.claudeCLI, .claudeApp] { if var a = agents[k] { applyLimits(&a); agents[k] = a } }
+        if old.map({ !$0.sameNumbers(l) || l.at.timeIntervalSince($0.at) > 300 }) ?? true { saveLimits() }
     }
 
-    private struct ClaudeLimits { var fiveHour, week: Double?; var reset5h, resetWeek: Date?; var at: Date }
+    private struct ClaudeLimits: Codable {
+        var fiveHour, week: Double?; var reset5h, resetWeek: Date?; var at: Date; var app: Bool
+        func sameNumbers(_ o: ClaudeLimits) -> Bool {
+            fiveHour == o.fiveHour && week == o.week && reset5h == o.reset5h && resetWeek == o.resetWeek && app == o.app
+        }
+    }
+    /// The last plan-usage reports, kept in ~/.notchagents so they show right after the app restarts:
+    /// Claude Code only reports them when a session redraws its status line.
+    private static let limitsFile = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".notchagents/limits.json")
+    private func saveLimits() {
+        guard let data = try? JSONEncoder().encode(claudeLimits) else { return }
+        io.async {
+            try? data.write(to: Self.limitsFile, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.limitsFile.path)
+        }
+    }
+    private func loadLimits() {
+        guard let data = try? Data(contentsOf: Self.limitsFile),
+              let saved = try? JSONDecoder().decode([String: ClaudeLimits].self, from: data) else { return }
+        let now = Date()
+        // Only windows that are still running: a passed reset means the number is a previous window's.
+        claudeLimits = saved.filter { _, l in
+            [l.reset5h, l.resetWeek].contains { $0.map { $0 > now } ?? false } && now.timeIntervalSince(l.at) < 8 * 86400
+        }
+        for (path, l) in claudeLimits where l.app { appSessions.insert(path) }
+    }
     /// Plan limits per session (transcript path), as reported by that session's status line.
     /// Limits belong to an account, and sessions can be on different ones: each config folder has its own
     /// login, and the desktop app runs Claude Code with its own login token even when it shares a config
@@ -688,6 +710,8 @@ final class AgentStore: ObservableObject {
     private nonisolated static func parseTurnEnded(_ path: String) -> Bool {
         guard let lines = tailLines(path, bytes: 128 * 1024) else { return false }
         for line in lines.reversed() {
+            if line.contains("\"local_command\""), let o = json(line), o["type"] as? String == "system",
+               o["subtype"] as? String == "local_command" { return true }
             guard let o = json(line), let type = o["type"] as? String, type == "user" || type == "assistant",
                   let m = o["message"] as? [String: Any] else { continue }
             if type == "assistant" {
@@ -696,6 +720,8 @@ final class AgentStore: ObservableObject {
             }
             let text = (m["content"] as? String) ?? ((m["content"] as? [[String: Any]])?.compactMap { $0["text"] as? String }.joined() ?? "")
             if text.contains("Request interrupted by user") { return true }
+            // A local slash command (/model, /effort, /clear…) ran without the model: nothing is working.
+            if text.hasPrefix("<local-command-stdout>") { return true }
             if o["isMeta"] as? Bool == true { continue }
             return false
         }
@@ -787,6 +813,7 @@ final class AgentStore: ObservableObject {
 
     private var openCode: OpenCodeSnapshot?
     private var openCodeStamp: Date?
+    private var openCodeAsked: String?
 
     /// Re-reads OpenCode's database while it runs, only when the database has changed.
     private func pollOpenCode() {
@@ -824,6 +851,18 @@ final class AgentStore: ObservableObject {
         if let m = s.model { a.model = m }
         if let c = s.cwd { a.cwd = c }
         a.cost = s.cost; a.tokens = s.tokens
+        // OpenCode's questions show in the notch; they're answered in OpenCode itself, which the
+        // database can't do, so picking an option brings OpenCode to the front.
+        if let q = s.question {
+            // Once per question: after you've picked (and gone to OpenCode) it doesn't come back.
+            if openCodeAsked != q.id {
+                openCodeAsked = q.id
+                question = PendingQuestion(kind: .opencode, session: q.id, items: q.items, answer: nil)
+                SFX.play(.attention)
+            }
+        } else if question?.kind == .opencode {
+            question = nil
+        }
         if s.status.isBusy { a.turnStart = s.turnStart ?? a.turnStart ?? Date() }
         else if wasBusy, let start = a.turnStart { a.lastTurn = Date().timeIntervalSince(start); a.turnStart = nil }
         else { a.turnStart = nil }
@@ -1280,11 +1319,6 @@ enum ProcessScanner {
     /// runs under a runtime) and package markers found in the command line.
     private static let signatures: [(kind: AgentKind, names: Set<String>, markers: [String])] = [
         (.opencode, ["opencode"], ["opencode-ai/", "/opencode/bin/"]),
-        (.cursor, ["cursor-agent"], ["cursor-agent/"]),
-        (.gemini, ["gemini"], ["@google/gemini-cli"]),
-        (.copilot, ["copilot"], ["@github/copilot/"]),
-        (.amp, ["amp"], ["@sourcegraph/amp"]),
-        (.aider, ["aider"], ["/bin/aider", "-m aider"]),
     ]
 
     /// Every process's parent, executable path and whether it has a terminal, read from the kernel.
