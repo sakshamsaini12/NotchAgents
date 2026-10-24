@@ -1315,7 +1315,7 @@ enum ProcessScanner {
     static func isHeadless(_ pid: Int32) -> Bool {
         let a = args(of: pid) ?? ""
         let words = a.split(separator: " ").map(String.init)
-        if words.contains("-p") || words.contains("--print") || helperFlags.contains(where: a.contains) { return true }
+        if words.contains("-p") || words.contains("--print") || isHelper(a) { return true }
         var cur = info(pid)?.kp_eproc.e_ppid ?? 1
         var path = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
         for _ in 0..<16 where cur > 1 {
@@ -1348,7 +1348,11 @@ enum ProcessScanner {
     }
 
     /// Background helper modes of the claude binary that are not agent sessions.
-    private static let helperFlags = ["--chrome-native-host", "native-host", "mcp serve", "--mcp"]
+    private static let helperFlags: Set<String> = ["--chrome-native-host", "native-host", "--mcp"]
+    /// Whole words only: `--mcp` is a helper mode, `--mcp-config` an ordinary session flag.
+    private static func isHelper(_ args: String) -> Bool {
+        args.contains("mcp serve") || !helperFlags.isDisjoint(with: args.split(separator: " ").map(String.init))
+    }
     /// Script runtimes an npm-installed CLI runs under (`comm` is the runtime, not "claude").
     private static let runtimes: Set<String> = ["node", "bun", "deno"]
 
@@ -1412,7 +1416,7 @@ enum ProcessScanner {
             let a = args[pid] ?? ""
             // Skip claude processes spawned by another claude (subagents/helpers) and helper modes.
             if let pp = parent[pid], claude.contains(pp) { continue }
-            if helperFlags.contains(where: a.contains) { continue }
+            if isHelper(a) { continue }
             // One-shot `claude -p` runs aren't sessions you can watch or answer.
             let words = a.split(separator: " ").map(String.init)
             if words.contains("-p") || words.contains("--print") { continue }
