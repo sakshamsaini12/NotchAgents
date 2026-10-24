@@ -2,7 +2,7 @@
 
 Your AI coding agents, living in the MacBook notch.
 
-▶ **[Watch the launch video](docs/video/launch.mp4)** · Made by [@sakshamships](https://x.com/sakshamships)
+🌐 **[notchagents.vercel.app](https://notchagents.vercel.app)** · ▶ **[Watch the launch video](docs/video/launch.mp4)** · Made by [@sakshamships](https://x.com/sakshamships)
 
 ![NotchAgents showing Claude Code running tests, with its recent activity, context and usage](docs/images/hero.jpg)
 
