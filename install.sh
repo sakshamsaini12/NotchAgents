@@ -12,7 +12,7 @@
 set -euo pipefail
 
 VERSION=1.0
-SHA256=7e9e587dcfaa2dc3b0dd16d46301a9fb3d39134d3cd85bef913d9681ce5d48cf
+SHA256=eb9517df77299d063b05b5c333d58abce2db82bb991368cf8883be79748b4420
 URL="https://github.com/sakshamsaini12/NotchAgents/releases/download/v$VERSION/NotchAgents-$VERSION.dmg"
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
