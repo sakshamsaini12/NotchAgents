@@ -2,6 +2,8 @@
 
 Your AI coding agents, living in the MacBook notch.
 
+▶ **[Watch the launch video](docs/video/launch.mp4)** · Made by [@sakshamships](https://x.com/sakshamships)
+
 ![NotchAgents showing Claude Code running tests, with its recent activity, context and usage](docs/images/hero.jpg)
 
 NotchAgents turns the notch into a Dynamic Island for Claude Code, Codex and other coding agents. See at a glance which agents are running and what they're doing, approve tool calls without switching windows, answer questions, and keep an eye on usage, all from the top of your screen.

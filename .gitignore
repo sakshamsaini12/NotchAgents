@@ -17,3 +17,7 @@ __pycache__/
 # Release artifacts (attach to GitHub Releases instead)
 *.dmg
 dist/
+
+# Launch film project and its prompt (kept local; the rendered video ships in docs/video/)
+/video/
+docs/launch-video-prompt.md
