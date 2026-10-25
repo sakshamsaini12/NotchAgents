@@ -193,4 +193,12 @@ Contributions are welcome. Please open an issue first for larger changes.
 
 ## License
 
-[MIT](LICENSE)
+The code is [MIT](LICENSE).
+
+These files are used by the website and aren't covered by the MIT license; they belong to their owners and aren't licensed for reuse:
+
+- `docs/images/wall.jpg`: macOS wallpaper, © Apple Inc.
+- `docs/images/macbook.png`: MacBook mockup frame. MacBook is a trademark of Apple Inc.
+- `docs/video/launch.mp4` and `docs/video/poster.jpg`: the launch video and its poster, © Saksham Saini.
+
+NotchAgents isn't affiliated with or endorsed by Apple, Anthropic or OpenAI.
