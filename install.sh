@@ -11,8 +11,8 @@
 # quarantined, so macOS doesn't show the "not opened" warning; the checksum is what vouches for the file.
 set -euo pipefail
 
-VERSION=1.0
-SHA256=eb9517df77299d063b05b5c333d58abce2db82bb991368cf8883be79748b4420
+VERSION=1.0.1
+SHA256=d1658b27201989a76684d72f3532e860c47b0e1a0608e917a2ad5ed3c982db08
 URL="https://github.com/sakshamsaini12/NotchAgents/releases/download/v$VERSION/NotchAgents-$VERSION.dmg"
 
 say() { printf '\033[1m%s\033[0m\n' "$*"; }
