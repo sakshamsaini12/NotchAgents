@@ -128,7 +128,7 @@ struct PendingQuestion: Identifiable {
 }
 
 struct PendingPermission: Identifiable {
-    let id = UUID()
+    var id = UUID()
     let tool: String
     let summary: String
     var diff: [DiffLine] = []
@@ -432,16 +432,17 @@ final class AgentStore: ObservableObject {
             a.pending?.respond(nil)
             var answered = false
             SFX.play(.permission)
-            let pending = PendingPermission(tool: toolName ?? "Tool", summary: Self.summarize(input) ?? "", diff: Self.diff(input)) { [weak self] allow in
+            let rid = UUID()
+            let pending = PendingPermission(id: rid, tool: toolName ?? "Tool", summary: Self.summarize(input) ?? "", diff: Self.diff(input)) { [weak self] allow in
                 guard !answered else { return }
                 answered = true
-                guard let allow else { reply(nil); Task { @MainActor in self?.clearPending(kind, allowed: nil) }; return }
+                guard let allow else { reply(nil); Task { @MainActor in self?.clearPending(kind, id: rid, allowed: nil) }; return }
                 let decision: [String: Any] = allow
                     ? ["behavior": "allow"]
                     : ["behavior": "deny", "message": "Denied from the notch."]
                 let out: [String: Any] = ["hookSpecificOutput": ["hookEventName": "PermissionRequest", "decision": decision]]
                 reply(try? JSONSerialization.data(withJSONObject: out))
-                Task { @MainActor in self?.clearPending(kind, allowed: allow) }
+                Task { @MainActor in self?.clearPending(kind, id: rid, allowed: allow) }
             }
             a.pending = pending
             agents[kind] = a
@@ -480,8 +481,9 @@ final class AgentStore: ObservableObject {
         if let t = a.transcript { readTranscript(kind, path: t) }
     }
 
-    private func clearPending(_ kind: AgentKind, allowed: Bool?) {
-        guard var a = agents[kind] else { return }
+    /// Only while that request is still the pending one: answered in the terminal, the turn has already moved on.
+    private func clearPending(_ kind: AgentKind, id: UUID, allowed: Bool?) {
+        guard var a = agents[kind], a.pending?.id == id else { return }
         a.pending = nil
         a.status = allowed == true ? .tool : (allowed == false ? .thinking : .waiting)
         agents[kind] = a
