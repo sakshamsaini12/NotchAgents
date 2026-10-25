@@ -129,6 +129,7 @@ struct PendingQuestion: Identifiable {
 
 struct PendingPermission: Identifiable {
     var id = UUID()
+    var session = ""
     let tool: String
     let summary: String
     var diff: [DiffLine] = []
@@ -238,6 +239,8 @@ final class AgentStore: ObservableObject {
     /// only while one of its sessions has an open turn.
     private struct Turn { var start: Date; var last: Date; var transcript: String?; var pid: Int32? }
     private var turns: [AgentKind: [String: Turn]] = [:]
+    /// Approvals from other sessions of the same agent, shown one at a time behind `Agent.pending`.
+    private var queued: [AgentKind: [PendingPermission]] = [:]
     private var codexFile: URL?
     private var codexOffset: UInt64 = 0
     private var codexWritten: Date?
@@ -426,14 +429,10 @@ final class AgentStore: ObservableObject {
             }
             return
         case "PermissionRequest":
-            a.status = .waiting
-            a.tool = toolName
-            a.detail = Self.summarize(input)
-            a.pending?.respond(nil)
             var answered = false
             SFX.play(.permission)
             let rid = UUID()
-            let pending = PendingPermission(id: rid, tool: toolName ?? "Tool", summary: Self.summarize(input) ?? "", diff: Self.diff(input)) { [weak self] allow in
+            let pending = PendingPermission(id: rid, session: sid, tool: toolName ?? "Tool", summary: Self.summarize(input) ?? "", diff: Self.diff(input)) { [weak self] allow in
                 guard !answered else { return }
                 answered = true
                 guard let allow else { reply(nil); Task { @MainActor in self?.clearPending(kind, id: rid, allowed: nil) }; return }
@@ -444,16 +443,21 @@ final class AgentStore: ObservableObject {
                 reply(try? JSONSerialization.data(withJSONObject: out))
                 Task { @MainActor in self?.clearPending(kind, id: rid, allowed: allow) }
             }
-            a.pending = pending
+            if let shown = a.pending, shown.session != sid {
+                // Another session is already asking: this one waits its turn.
+                queued[kind, default: []].append(pending)
+            } else {
+                a.pending?.respond(nil)
+                show(pending, in: &a)
+            }
             agents[kind] = a
             // Fall back to the terminal prompt before the hook's own timeout.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 100) { [weak self] in
-                guard let self, self.agents[kind]?.pending?.id == pending.id else { return }
-                pending.respond(nil)
-            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 100) { pending.respond(nil) }
             return
         case "Stop":
-            let wasBusy = a.status.isBusy && sessionWasBusy
+            // Another session still waiting on you matters more than this one finishing.
+            let othersAsk = ([a.pending].compactMap { $0 } + queued[kind, default: []]).contains { $0.session != sid }
+            let wasBusy = a.status.isBusy && sessionWasBusy && !othersAsk
             a.lastTurn = a.turnStart.map { Date().timeIntervalSince($0) }
             a.status = .idle; a.tool = nil; a.detail = nil; a.turnStart = nil; a.finishLog()
             if wasBusy {
@@ -464,11 +468,15 @@ final class AgentStore: ObservableObject {
         case "SessionEnd": a.status = .offline; a.live = false
         default: break
         }
-        if event != "PermissionRequest", event != "Notification", a.pending != nil, event == "PostToolUse" || event == "Stop" {
-            // The user answered in the terminal instead.
-            a.pending?.respond(nil)
-            a.pending = nil
+        if event == "PostToolUse" || event == "Stop" {
+            // The user answered this session's request in the terminal instead.
+            let stale = queued[kind]?.filter { $0.session == sid } ?? []
+            queued[kind]?.removeAll { $0.session == sid }
+            stale.forEach { $0.respond(nil) }
+            if let p = a.pending, p.session == sid { p.respond(nil); a.pending = nil; showNext(&a) }
         }
+        // Another session's work doesn't hide the approval still waiting on you.
+        if let p = a.pending, p.session != sid { show(p, in: &a) }
         if question?.kind == kind, question?.session == sid, event == "PostToolUse" || event == "Stop" || event == "UserPromptSubmit" || event == "SessionEnd" {
             // Answered in the terminal (or the turn moved on).
             question?.answer?(nil)
@@ -483,10 +491,27 @@ final class AgentStore: ObservableObject {
 
     /// Only while that request is still the pending one: answered in the terminal, the turn has already moved on.
     private func clearPending(_ kind: AgentKind, id: UUID, allowed: Bool?) {
+        queued[kind]?.removeAll { $0.id == id }
         guard var a = agents[kind], a.pending?.id == id else { return }
         a.pending = nil
         a.status = allowed == true ? .tool : (allowed == false ? .thinking : .waiting)
+        if allowed == false { a.tool = nil; a.detail = nil }  // the denied tool never runs
+        showNext(&a)
         agents[kind] = a
+    }
+
+    private func show(_ p: PendingPermission, in a: inout Agent) {
+        a.pending = p
+        a.status = .waiting
+        a.tool = p.tool
+        a.detail = p.summary.isEmpty ? nil : p.summary
+    }
+
+    private func showNext(_ a: inout Agent) {
+        guard a.pending == nil, let next = queued[a.kind]?.first else { return }
+        queued[a.kind]?.removeFirst()
+        show(next, in: &a)
+        SFX.play(.permission)
     }
 
     /// Answer the notch question; nil hands it back to the terminal.
@@ -701,10 +726,13 @@ final class AgentStore: ObservableObject {
 
     /// Verdict per transcript at a given size, so an unchanged transcript isn't re-parsed every tick.
     /// Only touched from the serial `io` queue.
-    nonisolated(unsafe) private static var endedCache: [String: (size: UInt64, ended: Bool)] = [:]
+    nonisolated(unsafe) private static var endedCache: [String: (size: UInt64, ended: Bool?)] = [:]
 
     /// True when the newest conversational entry closes the turn.
-    nonisolated static func turnEnded(_ path: String) -> Bool {
+    nonisolated static func turnEnded(_ path: String) -> Bool { turnState(path) == true }
+
+    /// Whether the newest conversational entry closes the turn; nil when there is none yet.
+    nonisolated static func turnState(_ path: String) -> Bool? {
         let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? UInt64) ?? 0
         if let c = endedCache[path], c.size == size { return c.ended }
         let ended = parseTurnEnded(path)
@@ -712,8 +740,8 @@ final class AgentStore: ObservableObject {
         return ended
     }
 
-    private nonisolated static func parseTurnEnded(_ path: String) -> Bool {
-        guard let lines = tailLines(path, bytes: 128 * 1024) else { return false }
+    private nonisolated static func parseTurnEnded(_ path: String) -> Bool? {
+        guard let lines = tailLines(path, bytes: 128 * 1024) else { return nil }
         for line in lines.reversed() {
             if line.contains("\"local_command\""), let o = json(line), o["type"] as? String == "system",
                o["subtype"] as? String == "local_command" { return true }
@@ -730,7 +758,7 @@ final class AgentStore: ObservableObject {
             if o["isMeta"] as? Bool == true { continue }
             return false
         }
-        return false
+        return nil
     }
 
     // MARK: - Polling
@@ -739,7 +767,9 @@ final class AgentStore: ObservableObject {
         let known = hookTranscripts
         io.async { [weak self] in
             let procs = ProcessScanner.scan(known: known)
-            Task { @MainActor in self?.apply(procs) }
+            // Whether each session's turn is still open, for sessions no hook reports on.
+            let open = Dictionary(procs.transcripts.values.map { ($0.path, Self.turnState($0.path) == false) }) { a, _ in a }
+            Task { @MainActor in self?.apply(procs, open: open) }
         }
         pollCodex()
         pollOpenCode()
@@ -760,7 +790,7 @@ final class AgentStore: ObservableObject {
         }
     }
 
-    private func apply(_ p: ProcessScanner.Result) {
+    private func apply(_ p: ProcessScanner.Result, open: [String: Bool]) {
         hookTranscripts = hookTranscripts.filter { kill($0.key, 0) == 0 }
         for kind in [AgentKind.claudeCLI, .claudeApp] {
             var a = agents[kind]!
@@ -776,9 +806,10 @@ final class AgentStore: ObservableObject {
             if a.live {
                 if let pid = a.pid, pids.contains(pid) || hooked.contains(pid) {} else { a.pid = pids.max() ?? hooked.max() ?? a.pid }
                 if !wasLive || a.status == .offline { a.status = .idle }
-                if !hookSeen.contains(kind) { fallbackActivity(&a, transcripts: pids.compactMap { p.transcripts[$0] }) }
+                if !hookSeen.contains(kind) { fallbackActivity(&a, transcripts: pids.compactMap { p.transcripts[$0] }, open: open) }
             } else {
                 a.pending?.respond(nil)
+                queued.removeValue(forKey: kind)?.forEach { $0.respond(nil) }
                 turns[kind] = nil
                 a = Agent(kind: kind, model: a.model, cost: a.cost)
                 applyLimits(&a)
@@ -887,14 +918,26 @@ final class AgentStore: ObservableObject {
         applyLimits(&a)
     }
 
-    /// Without hooks, infer activity from the newest transcript's freshness.
-    /// Before any hook has arrived for this agent: status from its own sessions' transcripts.
-    private func fallbackActivity(_ a: inout Agent, transcripts: [URL]) {
+    /// Before any hook has arrived for this agent: status from its own sessions' transcripts. A turn
+    /// whose last entry leaves it open (a long tool run writes nothing for minutes) is still working.
+    private func fallbackActivity(_ a: inout Agent, transcripts: [URL], open: [String: Bool]) {
         guard let newest = transcripts.max(by: { Self.mtime($0) < Self.mtime($1) }) else { a.status = .idle; return }
         if a.kind == .claudeApp { appSessions.insert(newest.path) }
         if a.transcript != newest.path { switchSession(&a, to: newest.path) }
         let age = Date().timeIntervalSince(Self.mtime(newest))
-        a.status = age < 6 ? .thinking : .idle
+        let wasBusy = a.status.isBusy
+        a.status = (open[newest.path] == true && age < 600) || (open[newest.path] == nil && age < 6) ? .thinking : .idle
+        if a.status.isBusy { if !wasBusy { a.turnStart = Date() } }
+        else if wasBusy, let start = a.turnStart {
+            a.turnStart = nil
+            a.lastTurn = Date().timeIntervalSince(start)
+            // A blip (one stray write after the turn) is not a turn worth announcing.
+            if a.lastTurn! > 3 {
+                let bits = [Self.duration(a.lastTurn).map { "Done in \($0)" } ?? "Done", a.cwd.map { ($0 as NSString).lastPathComponent }]
+                raise(IslandAlert(kind: a.kind, style: .done, title: "\(a.kind.title) finished",
+                                  message: bits.compactMap { $0 }.joined(separator: "  ·  ")), for: 6)
+            }
+        }
     }
 
     /// Timestamp of the last real user prompt (not a tool result) in a Claude transcript's tail.
