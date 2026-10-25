@@ -39,7 +39,7 @@ Only agents that are running appear in the notch and the menu bar.
 
 ## Requirements
 
-- A Mac with macOS 15 (Sequoia) or later. It works without a notch too; the island sits at the top centre of the screen.
+- An Apple silicon Mac with macOS 15 (Sequoia) or later. It works without a notch too; the island sits at the top centre of the screen. The release DMG is Apple silicon only; Intel Macs can try building from source.
 - To build from source: Xcode or the Command Line Tools, with Swift 6 (`xcode-select --install`), and Python 3.
 
 ## Install
@@ -127,7 +127,8 @@ NotchAgents is local only. There's no account, no analytics, no crash reporting 
 ## Uninstall
 
 ```bash
-./build.sh --uninstall-hooks          # remove the hooks and status line from every Claude config
+# remove the hooks and status line from every Claude config (from a clone: ./build.sh --uninstall-hooks)
+curl -fsSL https://raw.githubusercontent.com/sakshamsaini12/NotchAgents/main/hooks/install_hooks.py | python3 - --uninstall
 rm -rf /Applications/NotchAgents.app ~/.notchagents
 defaults delete local.notchagents     # optional: forget preferences
 ```
