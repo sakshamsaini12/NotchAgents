@@ -31,7 +31,7 @@ When you're not hovering, the notch stays small: one orb per running agent and t
 | Agent | How it's detected | What you see |
 |---|---|---|
 | **Claude Code** (terminal, VS Code, Cursor, JetBrains) | Claude Code hooks + process scan | Full status, tool activity, approvals, questions, context, limits, cost |
-| **Claude App** (Claude Code sessions in the desktop app) | Hooks + process scan | Same as above |
+| **Claude App** (Claude Code sessions in the desktop app) | Hooks + process scan | Status, tool activity, approvals, questions, context, cost (no plan limits: the desktop app has no status line) |
 | **Codex** (CLI, desktop, or hosted by another app) | Codex's session logs + process scan | Status, tool activity, context, limits |
 | **OpenCode** (terminal, or hosted by another app) | Process scan + OpenCode's local database (read-only) | Status, tool activity, model, session cost and tokens |
 
