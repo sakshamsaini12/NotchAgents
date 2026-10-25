@@ -70,7 +70,7 @@ struct MenuBarView: View {
                 if let c = codex, c.limit5h != nil || c.limitWeek != nil { usage("Codex", c) }
             }
             Divider().opacity(0.5)
-            HookStatus(store: store)
+            HookStatus(store: store, inMenu: true)
             if !store.hooksInstalled, Bundle.main.url(forResource: "notch-hook", withExtension: "sh") != nil {
                 Button("Install Claude Code hooks") { store.installHooks() }.controlSize(.small)
             }

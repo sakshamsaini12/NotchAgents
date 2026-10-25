@@ -550,7 +550,9 @@ private struct QuestionOption: View {
             }
             .frame(width: 18, height: 18)
             Text(option.label).font(.system(size: 12.5, weight: .medium)).foregroundStyle(Ink.primary).lineLimit(1)
-            Text(option.detail).font(.system(size: 11)).foregroundStyle(Ink.tertiary).lineLimit(1).truncationMode(.tail)
+            if option.detail.caseInsensitiveCompare(option.label) != .orderedSame {
+                Text(option.detail).font(.system(size: 11)).foregroundStyle(Ink.tertiary).lineLimit(1).truncationMode(.tail)
+            }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 10)
@@ -768,16 +770,19 @@ private struct OfflinePanel: View {
 /// One line on whether Claude Code is wired up: server listening, hooks installed, events arriving.
 struct HookStatus: View {
     @ObservedObject var store: AgentStore
+    /// In the menu bar panel: the install button sits right below, and the text may wrap.
+    var inMenu = false
 
     var body: some View {
         let (color, text): (Color, String) =
             store.serverOK == false ? (Color(hex: 0xF0605A), "Can't listen on 127.0.0.1:47823. Is another copy of NotchAgents running?")
-            : !store.hooksInstalled ? (amber, "Claude Code hooks aren't installed. Install them from the menu bar icon.")
+            : !store.hooksInstalled ? (amber, inMenu ? "Claude Code hooks aren't installed." : "Claude Code hooks aren't installed. Install them from the menu bar icon.")
             : store.hooksActive ? (.green, "Connected to Claude Code")
             : (Ink.tertiary, "Hooks installed. Waiting for the first Claude Code event.")
-        HStack(spacing: 6) {
+        HStack(alignment: inMenu ? .firstTextBaseline : .center, spacing: 6) {
             Circle().fill(color).frame(width: 5, height: 5)
-            Text(text).font(.system(size: 10.5)).foregroundStyle(Ink.tertiary).lineLimit(1).truncationMode(.tail)
+            Text(text).font(.system(size: 10.5)).foregroundStyle(Ink.tertiary).lineLimit(inMenu ? nil : 1).truncationMode(.tail)
+                .fixedSize(horizontal: false, vertical: inMenu)
         }
     }
 }
