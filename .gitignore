@@ -18,6 +18,6 @@ __pycache__/
 *.dmg
 dist/
 
-# Launch film project and its prompt (kept local; the rendered video ships in docs/video/)
+# Launch film project and its prompt (kept local; the rendered video ships with the website repo)
 /video/
 docs/launch-video-prompt.md
