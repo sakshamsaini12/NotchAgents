@@ -28,7 +28,7 @@ mnt="$tmp/mnt"
 cleanup() { hdiutil detach "$mnt" -quiet >/dev/null 2>&1 || true; rm -rf "$tmp"; }
 trap cleanup EXIT
 
-say "Downloading NotchAgents $VERSION…"
+say "Downloading NotchAgents ${VERSION}…"
 curl -fL --proto '=https' --tlsv1.2 --progress-bar -o "$tmp/NotchAgents.dmg" "$URL" || fail "download failed."
 
 say "Checking the download…"
